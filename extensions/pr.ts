@@ -52,6 +52,8 @@ type ParsedStatusLine = {
 	hasWorktree: boolean;
 };
 
+const STATUS_WITH_SECOND_PATH = new Set(["R", "C"]);
+
 type RepoContext = {
 	repoRoot: string;
 	repoSlug: string;
@@ -107,33 +109,50 @@ const truncateText = (
 	};
 };
 
-const parseStatusLine = (raw: string): ParsedStatusLine => {
-	if (raw.startsWith("?? ")) {
-		const path = raw.slice(3).trim();
-		return {
-			raw,
-			indexStatus: "?",
-			worktreeStatus: "?",
-			path,
-			isUntracked: true,
-			hasStaged: false,
-			hasWorktree: true,
-		};
-	}
+const formatStatusPath = (path: string, originalPath?: string): string =>
+	originalPath ? `${originalPath} -> ${path}` : path;
 
-	const path = raw.slice(3).split(" -> ").at(-1)?.trim() ?? raw.slice(3).trim();
-	const indexStatus = raw[0] ?? " ";
-	const worktreeStatus = raw[1] ?? " ";
+const parseStatusEntry = (entry: string, originalPath?: string): ParsedStatusLine => {
+	const indexStatus = entry[0] ?? " ";
+	const worktreeStatus = entry[1] ?? " ";
+	const path = entry.slice(3);
+	const isUntracked = indexStatus === "?" && worktreeStatus === "?";
 
 	return {
-		raw,
+		raw: `${indexStatus}${worktreeStatus} ${formatStatusPath(path, originalPath)}`,
 		indexStatus,
 		worktreeStatus,
 		path,
-		isUntracked: false,
-		hasStaged: indexStatus !== " ",
+		isUntracked,
+		hasStaged: !isUntracked && indexStatus !== " ",
 		hasWorktree: worktreeStatus !== " ",
 	};
+};
+
+const parseStatusEntries = (stdout: string): ParsedStatusLine[] => {
+	// `git status --porcelain -z` emits NUL-delimited paths without C-style quoting.
+	// Rename/copy entries use two path fields: `<new-path>\0<old-path>\0`.
+	const entries = stdout.split("\0");
+	const lines: ParsedStatusLine[] = [];
+
+	for (let index = 0; index < entries.length; index += 1) {
+		const entry = entries[index];
+		if (!entry) {
+			continue;
+		}
+
+		const indexStatus = entry[0] ?? " ";
+		const worktreeStatus = entry[1] ?? " ";
+		const hasSecondPath = STATUS_WITH_SECOND_PATH.has(indexStatus) || STATUS_WITH_SECOND_PATH.has(worktreeStatus);
+		const originalPath = hasSecondPath ? entries[index + 1] || undefined : undefined;
+		if (hasSecondPath) {
+			index += 1;
+		}
+
+		lines.push(parseStatusEntry(entry, originalPath));
+	}
+
+	return lines;
 };
 
 const isProbablyBinary = (buffer: Buffer): boolean => buffer.includes(0);
@@ -343,12 +362,8 @@ const buildRepoContext = async (pi: ExtensionAPI, ctx: ExtensionCommandContext):
 		return null;
 	}
 
-	const statusResult = await execChecked(pi, "read git status", "git", ["-C", repoRoot, "status", "--porcelain"]);
-	const statusLines = statusResult.stdout
-		.split(/\r?\n/)
-		.map((line) => line.trimEnd())
-		.filter((line) => line.length > 0)
-		.map(parseStatusLine);
+	const statusResult = await execChecked(pi, "read git status", "git", ["-C", repoRoot, "status", "--porcelain", "-z"]);
+	const statusLines = parseStatusEntries(statusResult.stdout);
 
 	if (statusLines.length === 0) {
 		ctx.ui.notify("No local changes found", "warning");
