@@ -91,8 +91,13 @@ const quoteShellArg = (value: string): string => {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
 };
 
-const truncateText = (label: string, value: string, maxChars: number): { text: string; warning?: string } => {
-	if (value.length <= maxChars) {
+const truncateText = (
+	label: string,
+	value: string,
+	maxChars: number,
+	wasTruncated = value.length > maxChars,
+): { text: string; warning?: string } => {
+	if (!wasTruncated) {
 		return { text: value };
 	}
 
@@ -277,8 +282,15 @@ const collectUntrackedPreviews = async (
 					continue;
 				}
 
-				const text = sampledBuffer.toString("utf8");
-				const truncated = truncateText(`Preview for ${line.path}`, text, MAX_UNTRACKED_FILE_BYTES);
+				const previewBytesWereTruncated = bytesRead > MAX_UNTRACKED_FILE_BYTES;
+				const previewTextBuffer = sampledBuffer.subarray(0, MAX_UNTRACKED_FILE_BYTES);
+				const text = previewTextBuffer.toString("utf8");
+				const truncated = truncateText(
+					`Preview for ${line.path}`,
+					text,
+					MAX_UNTRACKED_FILE_BYTES,
+					previewBytesWereTruncated,
+				);
 				if (truncated.warning) {
 					warnings.push(truncated.warning);
 				}
