@@ -1,6 +1,6 @@
 import { complete, type UserMessage } from "@earendil-works/pi-ai";
 import { BorderedLoader, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, open, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -267,18 +267,25 @@ const collectUntrackedPreviews = async (
 	for (const line of untracked) {
 		const absolutePath = resolve(repoRoot, line.path);
 		try {
-			const buffer = await readFile(absolutePath);
-			if (isProbablyBinary(buffer)) {
-				previews.push(`### ${line.path}\n[BINARY FILE OMITTED]`);
-				continue;
-			}
+			const fileHandle = await open(absolutePath, "r");
+			try {
+				const previewBuffer = Buffer.alloc(MAX_UNTRACKED_FILE_BYTES + 1);
+				const { bytesRead } = await fileHandle.read(previewBuffer, 0, previewBuffer.length, 0);
+				const sampledBuffer = previewBuffer.subarray(0, bytesRead);
+				if (isProbablyBinary(sampledBuffer)) {
+					previews.push(`### ${line.path}\n[BINARY FILE OMITTED]`);
+					continue;
+				}
 
-			const text = buffer.subarray(0, MAX_UNTRACKED_FILE_BYTES).toString("utf8");
-			const truncated = truncateText(`Preview for ${line.path}`, text, MAX_UNTRACKED_FILE_BYTES);
-			if (truncated.warning) {
-				warnings.push(truncated.warning);
+				const text = sampledBuffer.toString("utf8");
+				const truncated = truncateText(`Preview for ${line.path}`, text, MAX_UNTRACKED_FILE_BYTES);
+				if (truncated.warning) {
+					warnings.push(truncated.warning);
+				}
+				previews.push(`### ${line.path}\n${truncated.text}`);
+			} finally {
+				await fileHandle.close();
 			}
-			previews.push(`### ${line.path}\n${truncated.text}`);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			previews.push(`### ${line.path}\n[UNABLE TO READ FILE: ${message}]`);
