@@ -1,0 +1,15 @@
+{
+  "name": "pi-config",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal Pi extensions and setup notes",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
+  }
+}
