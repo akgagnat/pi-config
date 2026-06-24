@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import test from "node:test";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import prExtension, {
@@ -97,6 +97,13 @@ function createPi(execImpl: (command: string, args: string[]) => Promise<ExecRes
 	} as ExtensionAPI;
 
 	return { pi, commands };
+}
+
+function assertTempFilePath(filePath: string, fileName: string) {
+	const tempPath = dirname(filePath);
+	assert.equal(basename(filePath), fileName);
+	assert.equal(dirname(tempPath), tmpdir());
+	assert.match(basename(tempPath), /^pi-pr-/);
 }
 
 test("helper functions parse and format git state safely", async () => {
@@ -264,22 +271,20 @@ test("validateDraft enforces branch reuse rules and checks new branch collisions
 
 	const createCtxForBranch = createCtx();
 	const newBranchRepo = { ...reusedRepo, currentBranch: "main", willCreateBranch: true } satisfies RepoContext;
-	let showRefChecks = 0;
-	const branchPi = {
+	const createBranchValidationPi = (showRefResult: ExecResult) => ({
 		exec: async (_command: string, args: string[]) => {
 			if (args.includes("check-ref-format")) {
 				return ok();
 			}
 			if (args.includes("show-ref")) {
-				showRefChecks += 1;
-				return showRefChecks === 1 ? ok() : fail();
+				return showRefResult;
 			}
 			throw new Error(`Unexpected args: ${args.join(" ")}`);
 		},
-	} as ExtensionAPI;
+	}) as ExtensionAPI;
 
 	const existingBranch = await validateDraft(
-		branchPi,
+		createBranchValidationPi(ok()),
 		createCtxForBranch,
 		newBranchRepo,
 		{ branch: "feature/new-branch", commit: "msg", prTitle: "title", prBody: "body" },
@@ -291,7 +296,7 @@ test("validateDraft enforces branch reuse rules and checks new branch collisions
 
 	const validCtx = createCtx();
 	const valid = await validateDraft(
-		branchPi,
+		createBranchValidationPi(fail()),
 		validCtx,
 		newBranchRepo,
 		{ branch: "feature/new-branch", commit: "msg", prTitle: "title", prBody: "body" },
@@ -407,15 +412,19 @@ test("executePrFlow stages, commits, pushes, and creates a draft PR", async () =
 	const ctx = createCtx();
 	const calls: string[] = [];
 	let commitFileContents = "";
+	let commitFilePath = "";
 	let prBodyFileContents = "";
+	let prBodyFilePath = "";
 	const { pi } = createPi(async (command, args) => {
 		calls.push([command, ...args].join(" "));
 		if (command === "git" && args.includes("commit")) {
-			commitFileContents = await readFile(args[args.indexOf("-F") + 1]!, "utf8");
+			commitFilePath = args[args.indexOf("-F") + 1]!;
+			commitFileContents = await readFile(commitFilePath, "utf8");
 			return ok();
 		}
 		if (command === "gh") {
-			prBodyFileContents = await readFile(args[args.indexOf("--body-file") + 1]!, "utf8");
+			prBodyFilePath = args[args.indexOf("--body-file") + 1]!;
+			prBodyFileContents = await readFile(prBodyFilePath, "utf8");
 			return ok("https://github.com/owner/repo/pull/123\n");
 		}
 		return ok();
@@ -425,11 +434,13 @@ test("executePrFlow stages, commits, pushes, and creates a draft PR", async () =
 
 	assert.equal(calls[0], "git -C /repo switch -c feature/pr-draft");
 	assert.equal(calls[1], "git -C /repo add -A");
-	assert.match(calls[2] ?? "", /^git -C \/repo commit -F \/tmp\/pi-pr-[^/]+\/commit-message\.txt$/);
+	assertTempFilePath(commitFilePath, "commit-message.txt");
+	assert.equal(calls[2], `git -C /repo commit -F ${commitFilePath}`);
 	assert.equal(calls[3], "git -C /repo push -u origin feature/pr-draft");
-	assert.match(
-		calls[4] ?? "",
-		/^gh pr create --repo owner\/repo --base main --head feature\/pr-draft --title Add initial test coverage --body-file \/tmp\/pi-pr-[^/]+\/pr-body\.md --draft$/,
+	assertTempFilePath(prBodyFilePath, "pr-body.md");
+	assert.equal(
+		calls[4],
+		`gh pr create --repo owner/repo --base main --head feature/pr-draft --title Add initial test coverage --body-file ${prBodyFilePath} --draft`,
 	);
 	assert.equal(commitFileContents, "Add initial test coverage\n");
 	assert.equal(prBodyFileContents, "### Summary\n- Add tests\n");
