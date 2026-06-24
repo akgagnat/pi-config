@@ -2,13 +2,13 @@
 
 ## Aim
 
-This repo is the source of truth for my personal Pi extension setup.
+This repo is the source of truth for my personal Pi extension and skill setup.
 
 Its goals are to:
 
-- keep my custom Pi extensions in version control
-- make it easy to recreate my extension setup on a new Linux laptop or Mac
-- document the small amount of Pi configuration needed to load those extensions
+- keep my custom Pi extensions and skills in version control
+- make it easy to recreate my Pi setup on a new Linux laptop or Mac
+- document the small amount of Pi configuration needed to load those extensions and skills
 - keep a lightweight inventory of third-party Pi extensions/packages I use
 
 ## Scope boundaries
@@ -16,6 +16,7 @@ Its goals are to:
 Included in v1:
 
 - custom extensions authored in this repo
+- repo-local skills authored in this repo
 - setup documentation
 - a minimal global Pi settings example
 - a markdown inventory of third-party Pi items
@@ -23,7 +24,6 @@ Included in v1:
 Explicitly out of scope in v1:
 
 - prompts
-- skills
 - themes
 - project-local `.pi` scaffolding
 - automated sync/apply scripts
@@ -43,9 +43,15 @@ Conventions:
 - use a directory per extension once it grows beyond a single file
 - activate extensions explicitly by path in Pi settings
 
+### `skills/`
+
+Holds repo-local Pi skills that are loaded explicitly through Pi settings.
+
+Skills are source files in this repo, but they are still discovered by Pi as skills, not executed as extensions.
+
 ### `config/`
 
-Holds the minimal global Pi config guidance for loading this repo's extensions.
+Holds the minimal global Pi config guidance for loading this repo's extensions and skills.
 
 This is documentation and example config only. It is not a generated or authoritative runtime config system.
 
@@ -69,3 +75,4 @@ Contains supporting docs:
 - avoid storing secrets
 - avoid copying runtime files into this repo unless they are true source files
 - keep activation explicit so experiments do not load accidentally
+- keep extension execution and shared skill policy separate when a workflow needs both

@@ -8,12 +8,14 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import prExtension, {
 	buildConfirmationSummary,
 	buildDraftDocument,
+	buildPrPlannerSystemPrompt,
 	buildRepoContext,
 	collectUntrackedPreviews,
 	executePrFlow,
 	extractTextResponse,
 	generateDraft,
 	formatCommand,
+	loadPrPlannerPolicy,
 	parseDraftDocument,
 	parseGithubRepoSlug,
 	requestDraftDocument,
@@ -253,6 +255,31 @@ test("buildRepoContext assembles selected status, diffs, and untracked previews"
 	}
 });
 
+test("loadPrPlannerPolicy reads the repo skill regardless of cwd", async () => {
+	const originalCwd = process.cwd();
+	const otherDir = await mkdtemp(join(tmpdir(), "pi-pr-skill-cwd-"));
+	try {
+		process.chdir(otherDir);
+		const policy = await loadPrPlannerPolicy();
+		assert.match(policy, /name: pr-planner/);
+		assert.match(policy, /# \/pr Planner Policy/);
+	} finally {
+		process.chdir(originalCwd);
+		await rm(otherDir, { recursive: true, force: true });
+	}
+});
+
+test("loadPrPlannerPolicy falls back when the skill is missing or empty", async () => {
+	const missingPolicy = await loadPrPlannerPolicy(async () => {
+		throw new Error("ENOENT");
+	});
+	assert.match(missingPolicy, /Draft one branch name/);
+	assert.match(missingPolicy, /### Summary/);
+
+	const emptyPolicy = await loadPrPlannerPolicy(async () => "   ");
+	assert.equal(emptyPolicy, missingPolicy);
+});
+
 test("validateDraft rejects empty commit, PR title, and PR body", async () => {
 	const ctx = createCtx();
 	const repoContext = {
@@ -382,33 +409,40 @@ test("requestDraftDocument calls the model with repo context and handles auth or
 	}> = [];
 
 	const ctx = createCtx();
-	const document = await requestDraftDocument(ctx, repoContext, signal, async (model, request, options) => {
-		const firstMessage = request.messages[0];
-		const firstPart = Array.isArray(firstMessage?.content)
-			? firstMessage.content.find((part): part is { type: "text"; text: string } => typeof part !== "string" && part.type === "text")
-			: undefined;
-		completeCalls.push({
-			model,
-			systemPrompt: request.systemPrompt ?? "",
-			messageText: firstPart?.text ?? "",
-			apiKey: options?.apiKey,
-			headers: options?.headers ?? {},
-			signal: options?.signal,
-		});
-		return {
-			stopReason: "complete",
-			content: [
-				{ type: "text", text: "first" },
-				{ type: "image" },
-				{ type: "text", text: "second" },
-			],
-		} as never;
-	});
+	const loadedPolicy = "# Loaded policy\n\nUse the skill text.";
+	const document = await requestDraftDocument(
+		ctx,
+		repoContext,
+		signal,
+		async (model, request, options) => {
+			const firstMessage = request.messages[0];
+			const firstPart = Array.isArray(firstMessage?.content)
+				? firstMessage.content.find((part): part is { type: "text"; text: string } => typeof part !== "string" && part.type === "text")
+				: undefined;
+			completeCalls.push({
+				model,
+				systemPrompt: request.systemPrompt ?? "",
+				messageText: firstPart?.text ?? "",
+				apiKey: options?.apiKey,
+				headers: options?.headers ?? {},
+				signal: options?.signal,
+			});
+			return {
+				stopReason: "complete",
+				content: [
+					{ type: "text", text: "first" },
+					{ type: "image" },
+					{ type: "text", text: "second" },
+				],
+			} as never;
+		},
+		async () => loadedPolicy,
+	);
 
 	assert.equal(document, "first\nsecond");
 	assert.equal(completeCalls.length, 1);
 	assert.equal(completeCalls[0]?.model, ctx.model);
-	assert.match(completeCalls[0]?.systemPrompt ?? "", /Output exactly these markdown sections/);
+	assert.equal(completeCalls[0]?.systemPrompt, buildPrPlannerSystemPrompt(loadedPolicy));
 	assert.equal(completeCalls[0]?.messageText, "repo context");
 	assert.equal(completeCalls[0]?.apiKey, "test-key");
 	assert.deepEqual(completeCalls[0]?.headers, {});
