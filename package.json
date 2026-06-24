@@ -6,8 +6,8 @@
   "description": "Personal Pi extensions and setup notes",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test --experimental-transform-types tests/**/*.test.ts",
-    "test:coverage": "node --test --experimental-transform-types --experimental-test-coverage tests/**/*.test.ts"
+    "test": "node --test --experimental-transform-types \"tests/**/*.test.ts\"",
+    "test:coverage": "node --test --experimental-transform-types --experimental-test-coverage \"tests/**/*.test.ts\""
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "*",
