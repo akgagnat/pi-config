@@ -141,6 +141,7 @@ test("helper functions parse and format git state safely", async () => {
 		"first\nsecond",
 	);
 	assert.equal(slugifyBranchName("  Ship PR Draft Support!!!  "), "ship-pr-draft-support");
+	assert.equal(slugifyBranchName("!!!"), "update-change");
 });
 
 test("draft documents round-trip and invalid documents fail to parse", async () => {
@@ -154,6 +155,10 @@ test("draft documents round-trip and invalid documents fail to parse", async () 
 	const document = buildDraftDocument(draft, false);
 	assert.match(document, /Keep the four ## headings intact/);
 	assert.deepEqual(parseDraftDocument(document), draft);
+
+	const fixedBranchDocument = buildDraftDocument(draft, true);
+	assert.match(fixedBranchDocument, /Keep the Branch section equal to the current branch/);
+	assert.deepEqual(parseDraftDocument(fixedBranchDocument), draft);
 	assert.equal(parseDraftDocument("## Branch\na\n## Branch\nb"), null);
 	assert.equal(parseDraftDocument("## Branch\na\n## Commit\nb"), null);
 });
@@ -246,6 +251,53 @@ test("buildRepoContext assembles selected status, diffs, and untracked previews"
 	} finally {
 		await rm(repoRoot, { recursive: true, force: true });
 	}
+});
+
+test("validateDraft rejects empty commit, PR title, and PR body", async () => {
+	const ctx = createCtx();
+	const repoContext = {
+		repoRoot: "/repo",
+		repoSlug: "owner/repo",
+		currentBranch: "main",
+		changeScope: "staged",
+		statusLines: [],
+		willCreateBranch: true,
+		warnings: [],
+		contextText: "",
+	} satisfies RepoContext;
+
+	assert.equal(
+		await validateDraft({ exec: async () => ok() } as unknown as ExtensionAPI, ctx, repoContext, {
+			branch: "feature/branch",
+			commit: "   ",
+			prTitle: "title",
+			prBody: "body",
+		}),
+		false,
+	);
+	assert.equal(
+		await validateDraft({ exec: async () => ok() } as unknown as ExtensionAPI, ctx, repoContext, {
+			branch: "feature/branch",
+			commit: "commit",
+			prTitle: "   ",
+			prBody: "body",
+		}),
+		false,
+	);
+	assert.equal(
+		await validateDraft({ exec: async () => ok() } as unknown as ExtensionAPI, ctx, repoContext, {
+			branch: "feature/branch",
+			commit: "commit",
+			prTitle: "title",
+			prBody: "   ",
+		}),
+		false,
+	);
+	assert.deepEqual(notificationsOf(ctx), [
+		{ message: "Commit message cannot be empty", level: "error" },
+		{ message: "PR title cannot be empty", level: "error" },
+		{ message: "PR body cannot be empty", level: "error" },
+	]);
 });
 
 test("validateDraft enforces branch reuse rules and checks new branch collisions", async () => {
