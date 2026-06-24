@@ -2,9 +2,12 @@
   "name": "pi-config",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "description": "Personal Pi extensions and setup notes",
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --experimental-transform-types tests/**/*.test.ts",
+    "test:coverage": "node --test --experimental-transform-types --experimental-test-coverage tests/**/*.test.ts"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "*",

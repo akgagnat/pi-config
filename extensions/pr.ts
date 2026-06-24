@@ -725,6 +725,39 @@ const executePrFlow = async (
 	}
 };
 
+export {
+	CommandFailure,
+	formatCommand,
+	quoteShellArg,
+	truncateText,
+	formatStatusPath,
+	parseStatusEntry,
+	parseStatusEntries,
+	isProbablyBinary,
+	extractTextResponse,
+	slugifyBranchName,
+	buildDraftDocument,
+	parseDraftDocument,
+	parseGithubRepoSlug,
+	execChecked,
+	selectChangeScope,
+	collectUntrackedPreviews,
+	buildRepoContext,
+	generateDraft,
+	validateDraft,
+	buildConfirmationSummary,
+	buildRecoveryNote,
+	executePrFlow,
+};
+
+export type {
+	ChangeScope,
+	DraftMetadata,
+	ParsedStatusLine,
+	RepoContext,
+	StepState,
+};
+
 export default function prExtension(pi: ExtensionAPI) {
 	pi.registerCommand("pr", {
 		description: "Create a draft PR from local changes",
