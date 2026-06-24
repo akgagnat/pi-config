@@ -1,5 +1,8 @@
 {
   "extensions": [
     "/path/to/pi-config/extensions/pr.ts"
+  ],
+  "skills": [
+    "/path/to/pi-config/skills"
   ]
 }

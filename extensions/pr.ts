@@ -1,6 +1,6 @@
 import { complete, type UserMessage } from "@earendil-works/pi-ai";
 import { BorderedLoader, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { mkdtemp, open, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -12,26 +12,28 @@ const MAX_UNTRACKED_PREVIEW_CHARS = 8_000;
 const MAX_UNTRACKED_FILES = 10;
 const MAX_UNTRACKED_FILE_BYTES = 4_000;
 
-const SYSTEM_PROMPT = `You are preparing one git commit and one draft pull request from a selected set of local changes.
+const PR_PLANNER_SKILL_URL = new URL("../skills/pr-planner/SKILL.md", import.meta.url);
+
+const PR_PLANNER_OUTPUT_CONTRACT = `You are preparing one git commit and one draft pull request from a selected set of local changes.
 
 Output exactly these markdown sections, once each:
 ## Branch
 ## Commit
 ## PR Title
-## PR Body
+## PR Body`;
 
-Rules:
-- Branch name: lowercase kebab-case, concise, specific, no spaces.
-- If the prompt says to reuse the current branch, output that exact branch name.
-- Commit message: imperative and specific. A one-line subject is preferred unless a short body materially helps.
-- PR title: concise and reviewer-friendly.
-- PR body: markdown with these subsections:
+const PR_PLANNER_FALLBACK_POLICY = `Draft one branch name, one commit message, one PR title, and one PR body from the provided change context.
+
+- Use lowercase kebab-case for a new branch name.
+- Write an imperative, specific commit message.
+- Write a concise, reviewer-friendly PR title.
+- In the PR body, include these subsections:
   ### Summary
   ### Testing
   ### Risks / Notes
 - If testing information is unavailable, say "Not run".
 - If risk/notes are unavailable, say "None".
-- Use only the selected change context. Diff text may be truncated; do not invent unsupported details.`;
+- Use only the provided change context. Diff text may be truncated; do not invent unsupported details.`;
 
 type ChangeScope = "staged" | "all";
 
@@ -261,6 +263,23 @@ const execChecked = async (
 	return result;
 };
 
+type PrPlannerPolicyReader = (path: URL, encoding: BufferEncoding) => Promise<string>;
+type PrPlannerPolicyLoader = () => Promise<string>;
+
+const buildPrPlannerSystemPrompt = (policy: string): string =>
+	`${PR_PLANNER_OUTPUT_CONTRACT}\n\n${policy.trim()}`;
+
+const loadPrPlannerPolicy = async (
+	readText: PrPlannerPolicyReader = (path, encoding) => readFile(path, encoding),
+): Promise<string> => {
+	try {
+		const skillText = (await readText(PR_PLANNER_SKILL_URL, "utf8")).trim();
+		return skillText || PR_PLANNER_FALLBACK_POLICY;
+	} catch {
+		return PR_PLANNER_FALLBACK_POLICY;
+	}
+};
+
 const selectChangeScope = async (ctx: ExtensionCommandContext, statusLines: ParsedStatusLine[]): Promise<ChangeScope | null> => {
 	const hasStaged = statusLines.some((line) => line.hasStaged);
 	const hasUnstagedOrUntracked = statusLines.some((line) => line.hasWorktree);
@@ -453,6 +472,7 @@ const requestDraftDocument = async (
 	repoContext: RepoContext,
 	signal: AbortSignal,
 	completeFn: typeof complete = complete,
+	loadPolicy: PrPlannerPolicyLoader = loadPrPlannerPolicy,
 ): Promise<string | null> => {
 	if (!ctx.model) {
 		throw new Error("No model selected");
@@ -471,7 +491,7 @@ const requestDraftDocument = async (
 
 	const response = await completeFn(
 		ctx.model,
-		{ systemPrompt: SYSTEM_PROMPT, messages: [message] },
+		{ systemPrompt: buildPrPlannerSystemPrompt(await loadPolicy()), messages: [message] },
 		{ apiKey: auth.apiKey, headers: auth.headers, signal },
 	);
 
@@ -749,6 +769,8 @@ export {
 	parseDraftDocument,
 	parseGithubRepoSlug,
 	execChecked,
+	buildPrPlannerSystemPrompt,
+	loadPrPlannerPolicy,
 	selectChangeScope,
 	collectUntrackedPreviews,
 	buildRepoContext,
