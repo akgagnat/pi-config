@@ -16,6 +16,7 @@ import prExtension, {
 	formatCommand,
 	parseDraftDocument,
 	parseGithubRepoSlug,
+	requestDraftDocument,
 	parseStatusEntries,
 	parseStatusEntry,
 	quoteShellArg,
@@ -65,6 +66,7 @@ function createCtx(options: {
 	mode?: string;
 	model?: ExtensionCommandContext["model"] | null;
 	ui?: Partial<ExtensionCommandContext["ui"]>;
+	modelRegistry?: Partial<ExtensionCommandContext["modelRegistry"]>;
 } = {}): ExtensionCommandContext {
 	const { ui, notifications, editors } = createUi(options.ui);
 	const ctx = {
@@ -73,6 +75,7 @@ function createCtx(options: {
 		ui,
 		modelRegistry: {
 			getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: {} }),
+			...options.modelRegistry,
 		},
 	} as unknown as ExtensionCommandContext;
 
@@ -303,6 +306,79 @@ test("validateDraft enforces branch reuse rules and checks new branch collisions
 	);
 	assert.equal(valid, true);
 	assert.deepEqual(notificationsOf(validCtx), []);
+});
+
+test("requestDraftDocument calls the model with repo context and handles auth or abort edges", async () => {
+	const repoContext = {
+		repoRoot: "/repo",
+		repoSlug: "owner/repo",
+		currentBranch: "feature/existing",
+		changeScope: "staged",
+		statusLines: [],
+		willCreateBranch: false,
+		warnings: [],
+		contextText: "repo context",
+	} satisfies RepoContext;
+	const signal = new AbortController().signal;
+	const completeCalls: Array<{
+		model: ExtensionCommandContext["model"] | null | undefined;
+		systemPrompt: string;
+		messageText: string;
+		apiKey?: string;
+		headers?: Record<string, string>;
+		signal?: AbortSignal;
+	}> = [];
+
+	const ctx = createCtx();
+	const document = await requestDraftDocument(ctx, repoContext, signal, async (model, request, options) => {
+		const firstMessage = request.messages[0];
+		const firstPart = Array.isArray(firstMessage?.content)
+			? firstMessage.content.find((part): part is { type: "text"; text: string } => typeof part !== "string" && part.type === "text")
+			: undefined;
+		completeCalls.push({
+			model,
+			systemPrompt: request.systemPrompt ?? "",
+			messageText: firstPart?.text ?? "",
+			apiKey: options?.apiKey,
+			headers: options?.headers ?? {},
+			signal: options?.signal,
+		});
+		return {
+			stopReason: "complete",
+			content: [
+				{ type: "text", text: "first" },
+				{ type: "image" },
+				{ type: "text", text: "second" },
+			],
+		} as never;
+	});
+
+	assert.equal(document, "first\nsecond");
+	assert.equal(completeCalls.length, 1);
+	assert.equal(completeCalls[0]?.model, ctx.model);
+	assert.match(completeCalls[0]?.systemPrompt ?? "", /Output exactly these markdown sections/);
+	assert.equal(completeCalls[0]?.messageText, "repo context");
+	assert.equal(completeCalls[0]?.apiKey, "test-key");
+	assert.deepEqual(completeCalls[0]?.headers, {});
+	assert.equal(completeCalls[0]?.signal, signal);
+
+	const aborted = await requestDraftDocument(ctx, repoContext, signal, async () => ({
+		stopReason: "aborted",
+		content: [],
+	} as never));
+	assert.equal(aborted, null);
+
+	const authFailureCtx = createCtx({
+		modelRegistry: {
+			getApiKeyAndHeaders: async () => ({ ok: false, error: "missing auth" }) as never,
+		},
+	});
+	await assert.rejects(
+		() => requestDraftDocument(authFailureCtx, repoContext, signal, async () => {
+			throw new Error("should not be called");
+		}),
+		/missing auth/,
+	);
 });
 
 test("generateDraft handles missing models, cancellation, malformed output, and branch reuse", async () => {

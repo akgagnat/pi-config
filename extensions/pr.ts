@@ -448,6 +448,40 @@ const buildRepoContext = async (pi: ExtensionAPI, ctx: ExtensionCommandContext):
 	};
 };
 
+const requestDraftDocument = async (
+	ctx: ExtensionCommandContext,
+	repoContext: RepoContext,
+	signal: AbortSignal,
+	completeFn: typeof complete = complete,
+): Promise<string | null> => {
+	if (!ctx.model) {
+		throw new Error("No model selected");
+	}
+
+	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+	if (!auth.ok || !auth.apiKey) {
+		throw new Error(auth.ok ? `No API key for ${ctx.model.provider}` : auth.error);
+	}
+
+	const message: UserMessage = {
+		role: "user",
+		content: [{ type: "text", text: repoContext.contextText }],
+		timestamp: Date.now(),
+	};
+
+	const response = await completeFn(
+		ctx.model,
+		{ systemPrompt: SYSTEM_PROMPT, messages: [message] },
+		{ apiKey: auth.apiKey, headers: auth.headers, signal },
+	);
+
+	if (response.stopReason === "aborted") {
+		return null;
+	}
+
+	return extractTextResponse(response.content);
+};
+
 const generateDraft = async (
 	ctx: ExtensionCommandContext,
 	repoContext: RepoContext,
@@ -461,32 +495,7 @@ const generateDraft = async (
 		const loader = new BorderedLoader(tui, theme, `Generating PR draft using ${ctx.model!.id}...`);
 		loader.onAbort = () => done(null);
 
-		const doGenerate = async () => {
-			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model!);
-			if (!auth.ok || !auth.apiKey) {
-				throw new Error(auth.ok ? `No API key for ${ctx.model!.provider}` : auth.error);
-			}
-
-			const message: UserMessage = {
-				role: "user",
-				content: [{ type: "text", text: repoContext.contextText }],
-				timestamp: Date.now(),
-			};
-
-			const response = await complete(
-				ctx.model!,
-				{ systemPrompt: SYSTEM_PROMPT, messages: [message] },
-				{ apiKey: auth.apiKey, headers: auth.headers, signal: loader.signal },
-			);
-
-			if (response.stopReason === "aborted") {
-				return null;
-			}
-
-			return extractTextResponse(response.content);
-		};
-
-		doGenerate()
+		requestDraftDocument(ctx, repoContext, loader.signal)
 			.then(done)
 			.catch((error) => {
 				console.error("/pr generation failed", error);
@@ -743,6 +752,7 @@ export {
 	selectChangeScope,
 	collectUntrackedPreviews,
 	buildRepoContext,
+	requestDraftDocument,
 	generateDraft,
 	validateDraft,
 	buildConfirmationSummary,
