@@ -35,8 +35,11 @@ test("result delivery defers completed jobs and lets an explicit wait consume th
 	delivery.defer({ id: "sa-1" });
 	delivery.consume(["sa-1"]);
 	assert.deepEqual(delivery.drain(), []);
+	delivery.consume(["sa-2"]);
 	delivery.defer({ id: "sa-2" });
-	assert.deepEqual(delivery.drain(), [{ id: "sa-2" }]);
+	assert.deepEqual(delivery.drain(), []);
+	delivery.defer({ id: "sa-3" });
+	assert.deepEqual(delivery.drain(), [{ id: "sa-3" }]);
 });
 
 test("job manager lets callers inspect work before collecting its result", async () => {
