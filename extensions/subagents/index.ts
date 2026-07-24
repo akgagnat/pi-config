@@ -22,12 +22,16 @@ import { Type, type Static } from "typebox";
 import { validateCwd } from "../../utils/cwd.ts";
 import { extractTextResponse, truncateMiddle } from "../../utils/text.ts";
 import { discoverAgents, type AgentProfile, type AgentScope, type AgentSource } from "./profiles.ts";
+import { truncateOutput as truncateBoundedOutput } from "./output.ts";
+import { isTrustedChildCwd } from "./policy.ts";
 import { ResultDelivery } from "./result-delivery.ts";
 
 const MAX_PARALLEL_TASKS = 4;
 const DEFAULT_TOOLS = ["read", "grep", "find", "ls"];
-const OUTPUT_CAP_CHARS = 20_000;
+const OUTPUT_CAP_BYTES = 20_000;
+const OUTPUT_CAP_LINES = 600;
 const LOG_CAP_CHARS = 40_000;
+const JOB_TIMEOUT_MS = 15 * 60_000;
 
 type JobStatus = "initializing" | "working" | "done" | "failed" | "aborted";
 
@@ -182,11 +186,6 @@ function getFinalAssistantOutput(messages: Message[]): string {
 	return "";
 }
 
-function truncateOutput(text: string): string {
-	return text.length <= OUTPUT_CAP_CHARS
-		? text
-		: `${text.slice(0, OUTPUT_CAP_CHARS)}\n\n[Output truncated after ${OUTPUT_CAP_CHARS} characters.]`;
-}
 
 function logJsonEvent(job: SubagentJob, event: any): void {
 	if (event.type === "message_start" && event.message?.role) {
@@ -303,7 +302,12 @@ async function runAgent(
 				addJobLog(job, `process error: ${error.message}`);
 				resolve(1);
 			});
+			const timeout = setTimeout(() => {
+				addJobLog(job, `timed out after ${Math.round(JOB_TIMEOUT_MS / 60_000)} minutes`);
+				abort();
+			}, JOB_TIMEOUT_MS);
 			child.on("close", (code) => {
+				clearTimeout(timeout);
 				if (buffer.trim()) processLine(buffer);
 				resolve(code ?? 0);
 			});
@@ -321,7 +325,7 @@ async function runAgent(
 		});
 
 		result.exitCode = exitCode;
-		result.output = truncateOutput(getFinalAssistantOutput(result.messages) || result.errorMessage || result.stderr || "(no output)");
+		result.output = truncateBoundedOutput(getFinalAssistantOutput(result.messages) || result.errorMessage || result.stderr || "(no output)", { maxBytes: OUTPUT_CAP_BYTES, maxLines: OUTPUT_CAP_LINES }).text;
 		if (wasAborted) result.stopReason = "aborted";
 		result.status = wasAborted ? "aborted" : exitCode === 0 && result.stopReason !== "error" ? "done" : "failed";
 		job.status = result.status;
@@ -377,6 +381,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		const cwdResult = validateCwd(ctx.cwd, params.cwd);
 		const job = createJob(params.agent, params.task, cwdResult.cwd, params.name);
 		if (cwdResult.error) throw new Error(cwdResult.error);
+		if (!isTrustedChildCwd(ctx.cwd, cwdResult.cwd)) throw new Error("cwd must be the trusted project directory or one of its descendants.");
 		const agent = agents.find((candidate) => candidate.name === params.agent);
 		if (!agent) throw new Error(`Unknown agent. Available: ${agents.map((candidate) => candidate.name).join(", ") || "none"}`);
 		job.completion = runAgent(ctx.cwd, agent, job, cwdResult.cwd, params.model, signal);
@@ -574,12 +579,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			const run = async (item: { agent: string; task: string; cwd?: string; name?: string; model?: string }) => {
 				const cwdResult = validateCwd(ctx.cwd, item.cwd);
 				const job = createJob(item.agent, item.task, cwdResult.cwd, item.name);
-				if (cwdResult.error) {
+				if (cwdResult.error || !isTrustedChildCwd(ctx.cwd, cwdResult.cwd)) {
+					const error = cwdResult.error ?? "cwd must be the trusted project directory or one of its descendants.";
 					job.status = "failed";
-					job.output = cwdResult.error;
+					job.output = error;
 					job.exitCode = 1;
 					job.finishedAt = Date.now();
-					addJobLog(job, cwdResult.error);
+					addJobLog(job, error);
 					return {
 						id: job.id,
 						name: job.name,
@@ -587,7 +593,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 						task: item.task,
 						status: "failed",
 						exitCode: 1,
-						output: cwdResult.error,
+						output: error,
 						stderr: "",
 						messages: [],
 					} satisfies RunResult;

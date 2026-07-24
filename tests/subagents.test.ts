@@ -4,9 +4,25 @@ import test from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { isTrustedChildCwd } from "../extensions/subagents/policy.ts";
+import { truncateOutput } from "../extensions/subagents/output.ts";
 import { ResultDelivery } from "../extensions/subagents/result-delivery.ts";
 import { JobManager } from "../extensions/subagents/jobs.ts";
 import { discoverAgents, parseFrontmatter } from "../extensions/subagents/profiles.ts";
+
+test("child cwd policy keeps profile agents inside the trusted parent project", () => {
+	assert.equal(isTrustedChildCwd("/work/project", "/work/project"), true);
+	assert.equal(isTrustedChildCwd("/work/project", "/work/project/packages/app"), true);
+	assert.equal(isTrustedChildCwd("/work/project", "/work/other"), false);
+});
+
+test("output truncation respects UTF-8 byte and line limits", () => {
+	assert.deepEqual(truncateOutput("one\ntwo\nthree", { maxBytes: 100, maxLines: 2 }), {
+		text: "one\ntwo\n\n[Output truncated: 2 of 3 lines shown.]",
+		truncated: true,
+	});
+	assert.equal(truncateOutput("ééé", { maxBytes: 4, maxLines: 10 }).text, "éé\n\n[Output truncated: 4 of 6 bytes shown.]");
+});
 
 test("result delivery defers completed jobs and lets an explicit wait consume them", () => {
 	const delivery = new ResultDelivery<{ id: string }>();
