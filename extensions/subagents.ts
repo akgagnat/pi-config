@@ -1,3 +1,16 @@
+/*
+ * Subagent extension design notes:
+ * - This extension follows Pi's extension API shape: a default factory receives ExtensionAPI and registers commands/tools.
+ * - Subagents are isolated by spawning a child `pi --mode json -p --no-session` process, appending the selected profile's
+ *   Markdown body as a system prompt, and parsing JSON events from stdout for assistant messages, logs, and status.
+ * - Agent profiles are Markdown files with frontmatter (`name`, `description`, optional `tools`, optional `model`) and the
+ *   body as the system prompt. Config agents live in this repo's `agents/`; user agents in Pi's global agent dir;
+ *   project agents in nearest `.pi/agents`.
+ * - Project-local agents are repository-controlled instructions, so they require trusted projects and optional confirmation.
+ * - Keep delegated work bounded: cap parallel tasks/output/logs, pass profile tools via `--tools`, use `--no-session`, and
+ *   propagate parent aborts to child processes.
+ */
+
 import { spawn } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
