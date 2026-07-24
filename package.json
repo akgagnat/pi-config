@@ -10,9 +10,9 @@
     "test:coverage": "node --test --experimental-transform-types --experimental-test-coverage \"tests/**/*.test.ts\""
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "^0.79.10",
+    "@earendil-works/pi-ai": "^0.82.0",
+    "@earendil-works/pi-coding-agent": "^0.82.0",
+    "@earendil-works/pi-tui": "^0.82.0",
     "@types/node": "^24.0.0",
     "typebox": "*",
     "typescript": "^5.9.3"
