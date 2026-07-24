@@ -393,7 +393,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		if (!isTrustedChildCwd(ctx.cwd, cwdResult.cwd)) throw new Error("cwd must be the trusted project directory or one of its descendants.");
 		const agent = agents.find((candidate) => candidate.name === params.agent);
 		if (!agent) throw new Error(`Unknown agent. Available: ${agents.map((candidate) => candidate.name).join(", ") || "none"}`);
-		job.completion = runAgent(ctx.cwd, agent, job, cwdResult.cwd, params.model, signal);
+		const inheritedModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+		job.completion = runAgent(ctx.cwd, agent, job, cwdResult.cwd, params.model ?? inheritedModel, signal);
 		job.completion.then((result) => {
 			updateStatus();
 			resultDelivery.defer(result);
@@ -629,7 +630,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 						messages: [],
 					} satisfies RunResult;
 				}
-				return runAgent(ctx.cwd, agent, job, cwdResult.cwd, item.model ?? params.model, signal);
+				const inheritedModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+				return runAgent(ctx.cwd, agent, job, cwdResult.cwd, item.model ?? params.model ?? inheritedModel, signal);
 			};
 
 			if (hasSingle) {
