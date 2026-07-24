@@ -1,12 +1,14 @@
 import { spawn } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Message } from "@earendil-works/pi-ai";
 import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
+import { validateCwd } from "../utils/cwd.ts";
+import { extractTextResponse, truncateMiddle } from "../utils/text.ts";
 
 const MAX_PARALLEL_TASKS = 4;
 const DEFAULT_TOOLS = ["read", "grep", "find", "ls"];
@@ -98,12 +100,6 @@ function makeJobId(): string {
 	return `sa-${String(nextJobNumber++).padStart(4, "0")}`;
 }
 
-function truncateMiddle(value: string, maxChars: number): string {
-	if (value.length <= maxChars) return value;
-	const keep = Math.floor((maxChars - 20) / 2);
-	return `${value.slice(0, keep)}\n... truncated ...\n${value.slice(-keep)}`;
-}
-
 function addJobLog(job: SubagentJob, line: string): void {
 	job.logs.push(`[${nowIso()}] ${line}`);
 	let combined = job.logs.join("\n");
@@ -137,21 +133,6 @@ function createJob(agent: string, task: string, cwd: string, requestedName?: str
 
 function findJob(query: string): SubagentJob | undefined {
 	return jobs.get(query) ?? [...jobs.values()].find((job) => job.name === query);
-}
-
-function validateCwd(baseCwd: string, requestedCwd?: string): { cwd: string; error?: string } {
-	if (requestedCwd !== undefined && requestedCwd.trim() === "") {
-		return { cwd: baseCwd, error: "cwd must not be empty" };
-	}
-
-	const cwd = requestedCwd === undefined ? baseCwd : isAbsolute(requestedCwd) ? requestedCwd : resolve(baseCwd, requestedCwd);
-	try {
-		if (!statSync(cwd).isDirectory()) return { cwd, error: `cwd is not a directory: ${cwd}` };
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		return { cwd, error: `cwd does not exist or is not accessible: ${cwd} (${message})` };
-	}
-	return { cwd };
 }
 
 function formatDuration(startedAt: number, finishedAt = Date.now()): string {
@@ -254,11 +235,7 @@ function getFinalAssistantOutput(messages: Message[]): string {
 	for (let index = messages.length - 1; index >= 0; index--) {
 		const message = messages[index];
 		if (message.role !== "assistant") continue;
-		return message.content
-			.filter((part): part is { type: "text"; text: string } => part.type === "text" && typeof part.text === "string")
-			.map((part) => part.text)
-			.join("\n")
-			.trim();
+		return extractTextResponse(message.content);
 	}
 	return "";
 }

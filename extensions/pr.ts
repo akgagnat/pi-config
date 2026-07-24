@@ -3,6 +3,9 @@ import { BorderedLoader, type ExtensionAPI, type ExtensionCommandContext } from 
 import { mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { parseGithubRepoSlug } from "../utils/github.ts";
+import { formatCommand, quoteShellArg } from "../utils/shell.ts";
+import { extractTextResponse, truncateText } from "../utils/text.ts";
 
 const BASE_BRANCH = "main";
 const REMOTE_NAME = "origin";
@@ -85,32 +88,6 @@ class CommandFailure extends Error {
 	}
 }
 
-const formatCommand = (command: string, args: string[]): string =>
-	[command, ...args.map(quoteShellArg)].join(" ");
-
-const quoteShellArg = (value: string): string => {
-	if (/^[A-Za-z0-9_./:@-]+$/.test(value)) {
-		return value;
-	}
-	return `'${value.replace(/'/g, `'\\''`)}'`;
-};
-
-const truncateText = (
-	label: string,
-	value: string,
-	maxChars: number,
-	wasTruncated = value.length > maxChars,
-): { text: string; warning?: string } => {
-	if (!wasTruncated) {
-		return { text: value };
-	}
-
-	return {
-		text: `${value.slice(0, maxChars)}\n\n[... ${label} truncated after ${maxChars.toLocaleString()} characters ...]`,
-		warning: `${label} was truncated before draft generation.`,
-	};
-};
-
 const formatStatusPath = (path: string, originalPath?: string): string =>
 	originalPath ? `${originalPath} -> ${path}` : path;
 
@@ -158,12 +135,6 @@ const parseStatusEntries = (stdout: string): ParsedStatusLine[] => {
 };
 
 const isProbablyBinary = (buffer: Buffer): boolean => buffer.includes(0);
-
-const extractTextResponse = (content: Array<{ type: string; text?: string }>): string =>
-	content.filter((part): part is { type: "text"; text: string } => part.type === "text" && typeof part.text === "string")
-		.map((part) => part.text)
-		.join("\n")
-		.trim();
 
 const slugifyBranchName = (value: string): string => {
 	const slug = value
@@ -230,24 +201,6 @@ const parseDraftDocument = (value: string): DraftMetadata | null => {
 	}
 
 	return { branch, commit, prTitle, prBody };
-};
-
-const parseGithubRepoSlug = (remoteUrl: string): string | null => {
-	const trimmed = remoteUrl.trim();
-	const patterns = [
-		/^git@github\.com:([^/]+\/[^/]+?)(?:\.git)?$/,
-		/^https?:\/\/github\.com\/([^/]+\/[^/]+?)(?:\.git)?$/,
-		/^ssh:\/\/git@github\.com\/([^/]+\/[^/]+?)(?:\.git)?$/,
-	];
-
-	for (const pattern of patterns) {
-		const match = trimmed.match(pattern);
-		if (match) {
-			return match[1];
-		}
-	}
-
-	return null;
 };
 
 const execChecked = async (
