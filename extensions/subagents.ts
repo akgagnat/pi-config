@@ -1,0 +1,638 @@
+import { spawn } from "node:child_process";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { Message } from "@earendil-works/pi-ai";
+import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type, type Static } from "typebox";
+
+const MAX_PARALLEL_TASKS = 4;
+const DEFAULT_TOOLS = ["read", "grep", "find", "ls"];
+const OUTPUT_CAP_CHARS = 20_000;
+const LOG_CAP_CHARS = 40_000;
+
+type AgentSource = "config" | "user" | "project";
+type JobStatus = "initializing" | "working" | "done" | "failed" | "aborted";
+
+type AgentConfig = {
+	name: string;
+	description: string;
+	systemPrompt: string;
+	source: AgentSource;
+	filePath: string;
+	model?: string;
+	tools?: string[];
+};
+
+type SubagentJob = {
+	id: string;
+	name: string;
+	agent: string;
+	task: string;
+	cwd: string;
+	status: JobStatus;
+	startedAt: number;
+	updatedAt: number;
+	finishedAt?: number;
+	model?: string;
+	exitCode?: number;
+	stopReason?: string;
+	errorMessage?: string;
+	output?: string;
+	stderr: string;
+	logs: string[];
+};
+
+type RunResult = {
+	id: string;
+	name: string;
+	agent: string;
+	source?: AgentSource;
+	task: string;
+	status: JobStatus;
+	exitCode: number;
+	output: string;
+	stderr: string;
+	messages: Message[];
+	model?: string;
+	stopReason?: string;
+	errorMessage?: string;
+};
+
+const TaskSchema = Type.Object({
+	agent: Type.String({ description: "Agent profile name" }),
+	task: Type.String({ description: "Task to delegate" }),
+	name: Type.Optional(Type.String({ description: "Human-readable name for this subagent job" })),
+	cwd: Type.Optional(Type.String({ description: "Working directory for this subagent" })),
+	model: Type.Optional(Type.String({ description: "Model to use for this subagent job. Defaults to the main agent model." })),
+});
+
+const SubagentParamsSchema = Type.Object({
+	agent: Type.Optional(Type.String({ description: "Agent profile name for single-task mode" })),
+	task: Type.Optional(Type.String({ description: "Task for single-task mode" })),
+	name: Type.Optional(Type.String({ description: "Human-readable name for the single subagent job" })),
+	model: Type.Optional(Type.String({ description: "Model to use for the subagent. Defaults to the main agent model." })),
+	tasks: Type.Optional(Type.Array(TaskSchema, { description: "Small parallel batch of delegated tasks" })),
+	scope: Type.Optional(
+		Type.Union([Type.Literal("config"), Type.Literal("user"), Type.Literal("project"), Type.Literal("all")], {
+			description: "Agent profile scope. Default: config.",
+		}),
+	),
+	confirmProjectAgents: Type.Optional(
+		Type.Boolean({ description: "Ask before running project-local agents. Default: true." }),
+	),
+});
+
+type SubagentParams = Static<typeof SubagentParamsSchema>;
+
+const jobs = new Map<string, SubagentJob>();
+let nextJobNumber = 1;
+
+function nowIso(): string {
+	return new Date().toISOString().slice(11, 19);
+}
+
+function makeJobId(): string {
+	return `sa-${String(nextJobNumber++).padStart(4, "0")}`;
+}
+
+function truncateMiddle(value: string, maxChars: number): string {
+	if (value.length <= maxChars) return value;
+	const keep = Math.floor((maxChars - 20) / 2);
+	return `${value.slice(0, keep)}\n... truncated ...\n${value.slice(-keep)}`;
+}
+
+function addJobLog(job: SubagentJob, line: string): void {
+	job.logs.push(`[${nowIso()}] ${line}`);
+	let combined = job.logs.join("\n");
+	while (combined.length > LOG_CAP_CHARS && job.logs.length > 1) {
+		job.logs.shift();
+		combined = job.logs.join("\n");
+	}
+	job.updatedAt = Date.now();
+}
+
+function createJob(agent: string, task: string, cwd: string, requestedName?: string): SubagentJob {
+	const id = makeJobId();
+	const taskPreview = task.replace(/\s+/g, " ").trim().slice(0, 48);
+	const name = requestedName?.trim() || `${agent}:${taskPreview || id}`;
+	const job: SubagentJob = {
+		id,
+		name,
+		agent,
+		task,
+		cwd,
+		status: "initializing",
+		startedAt: Date.now(),
+		updatedAt: Date.now(),
+		stderr: "",
+		logs: [],
+	};
+	addJobLog(job, `created job ${id} (${name})`);
+	jobs.set(id, job);
+	return job;
+}
+
+function findJob(query: string): SubagentJob | undefined {
+	return jobs.get(query) ?? [...jobs.values()].find((job) => job.name === query);
+}
+
+function validateCwd(baseCwd: string, requestedCwd?: string): { cwd: string; error?: string } {
+	if (requestedCwd !== undefined && requestedCwd.trim() === "") {
+		return { cwd: baseCwd, error: "cwd must not be empty" };
+	}
+
+	const cwd = requestedCwd === undefined ? baseCwd : isAbsolute(requestedCwd) ? requestedCwd : resolve(baseCwd, requestedCwd);
+	try {
+		if (!statSync(cwd).isDirectory()) return { cwd, error: `cwd is not a directory: ${cwd}` };
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return { cwd, error: `cwd does not exist or is not accessible: ${cwd} (${message})` };
+	}
+	return { cwd };
+}
+
+function formatDuration(startedAt: number, finishedAt = Date.now()): string {
+	const seconds = Math.max(0, Math.round((finishedAt - startedAt) / 1000));
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.floor(seconds / 60);
+	return `${minutes}m ${seconds % 60}s`;
+}
+
+function formatJobSummary(job: SubagentJob): string {
+	const duration = formatDuration(job.startedAt, job.finishedAt);
+	const suffix = job.exitCode !== undefined ? ` exit=${job.exitCode}` : "";
+	return `- ${job.id} ${job.status.padEnd(12)} ${job.name} [${job.agent}] ${duration}${suffix}`;
+}
+
+function formatStatusBlock(activeResults?: RunResult[]): string {
+	const activeIds = new Set(activeResults?.map((result) => result.id));
+	const recent = [...jobs.values()]
+		.sort((a, b) => b.startedAt - a.startedAt)
+		.slice(0, 20);
+	if (recent.length === 0) return "No subagent jobs yet.";
+	return recent
+		.map((job) => `${activeIds.has(job.id) ? "*" : " "} ${formatJobSummary(job)}`)
+		.join("\n");
+}
+
+function parseFrontmatter(markdown: string): { frontmatter: Record<string, string>; body: string } {
+	if (!markdown.startsWith("---\n")) return { frontmatter: {}, body: markdown };
+	const end = markdown.indexOf("\n---", 4);
+	if (end === -1) return { frontmatter: {}, body: markdown };
+
+	const raw = markdown.slice(4, end).trim();
+	const body = markdown.slice(end + "\n---".length).replace(/^\r?\n/, "");
+	const frontmatter: Record<string, string> = {};
+	for (const line of raw.split(/\r?\n/)) {
+		const match = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
+		if (match) frontmatter[match[1]] = match[2].trim().replace(/^['"]|['"]$/g, "");
+	}
+	return { frontmatter, body };
+}
+
+function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
+	if (!existsSync(dir)) return [];
+
+	const agents: AgentConfig[] = [];
+	for (const entry of readdirSync(dir, { withFileTypes: true })) {
+		if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
+		const filePath = join(dir, entry.name);
+		const { frontmatter, body } = parseFrontmatter(readFileSync(filePath, "utf8"));
+		if (!frontmatter.name || !frontmatter.description) continue;
+		agents.push({
+			name: frontmatter.name,
+			description: frontmatter.description,
+			systemPrompt: body.trim(),
+			source,
+			filePath,
+			model: frontmatter.model,
+			tools: frontmatter.tools?.split(",").map((tool) => tool.trim()).filter(Boolean),
+		});
+	}
+	return agents;
+}
+
+function findProjectAgentsDir(cwd: string): string | null {
+	let current = cwd;
+	while (true) {
+		const candidate = join(current, CONFIG_DIR_NAME, "agents");
+		if (existsSync(candidate)) return candidate;
+		const parent = dirname(current);
+		if (parent === current) return null;
+		current = parent;
+	}
+}
+
+function discoverAgents(cwd: string, scope: NonNullable<SubagentParams["scope"]>): AgentConfig[] {
+	const configDir = fileURLToPath(new URL("../agents", import.meta.url));
+	const userDir = join(getAgentDir(), "agents");
+	const projectDir = findProjectAgentsDir(cwd);
+
+	const dirs: Array<[string, AgentSource]> = [];
+	if (scope === "config" || scope === "all") dirs.push([configDir, "config"]);
+	if (scope === "user" || scope === "all") dirs.push([userDir, "user"]);
+	if ((scope === "project" || scope === "all") && projectDir) dirs.push([projectDir, "project"]);
+
+	const byName = new Map<string, AgentConfig>();
+	for (const [dir, source] of dirs) {
+		for (const agent of loadAgentsFromDir(dir, source)) byName.set(agent.name, agent);
+	}
+	return [...byName.values()];
+}
+
+function getPiInvocation(args: string[]): { command: string; args: string[] } {
+	const currentScript = process.argv[1];
+	if (currentScript && existsSync(currentScript)) return { command: process.execPath, args: [currentScript, ...args] };
+	const runtime = basename(process.execPath).toLowerCase();
+	return /^(node|bun)(\.exe)?$/.test(runtime) ? { command: "pi", args } : { command: process.execPath, args };
+}
+
+function getFinalAssistantOutput(messages: Message[]): string {
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message.role !== "assistant") continue;
+		return message.content
+			.filter((part): part is { type: "text"; text: string } => part.type === "text" && typeof part.text === "string")
+			.map((part) => part.text)
+			.join("\n")
+			.trim();
+	}
+	return "";
+}
+
+function truncateOutput(text: string): string {
+	return text.length <= OUTPUT_CAP_CHARS
+		? text
+		: `${text.slice(0, OUTPUT_CAP_CHARS)}\n\n[Output truncated after ${OUTPUT_CAP_CHARS} characters.]`;
+}
+
+function logJsonEvent(job: SubagentJob, event: any): void {
+	if (event.type === "message_start" && event.message?.role) {
+		addJobLog(job, `message_start ${event.message.role}`);
+		return;
+	}
+	if (event.type === "message_end" && event.message?.role) {
+		const message = event.message as Message;
+		if (message.role === "assistant") {
+			const text = truncateMiddle(getFinalAssistantOutput([message]), 500);
+			addJobLog(job, text ? `assistant: ${text}` : "assistant message_end");
+			return;
+		}
+		addJobLog(job, `message_end ${message.role}`);
+		return;
+	}
+	if (event.type === "tool_execution_start" || event.type === "tool_call") {
+		addJobLog(job, `tool ${event.toolName ?? "unknown"} started`);
+		return;
+	}
+	if (event.type === "tool_execution_end" || event.type === "tool_result_end") {
+		addJobLog(job, `tool ${event.toolName ?? "unknown"} finished`);
+		return;
+	}
+	if (event.type === "agent_start") addJobLog(job, "agent_start");
+	if (event.type === "agent_end") addJobLog(job, "agent_end");
+}
+
+async function runAgent(
+	cwd: string,
+	agent: AgentConfig,
+	job: SubagentJob,
+	taskCwd: string | undefined,
+	requestedModel: string | undefined,
+	signal: AbortSignal | undefined,
+): Promise<RunResult> {
+	const tempDir = await mkdtemp(join(tmpdir(), "pi-subagent-"));
+	const promptPath = join(tempDir, `${agent.name.replace(/[^A-Za-z0-9_.-]+/g, "_")}.md`);
+	await writeFile(promptPath, agent.systemPrompt, { encoding: "utf8", mode: 0o600 });
+
+	const model = requestedModel?.trim() || agent.model?.trim() || process.env.PI_MODEL?.trim();
+	job.model = model;
+
+	const args = ["--mode", "json", "-p", "--no-session", "--name", job.name, "--append-system-prompt", promptPath];
+	if (model) args.push("--model", model);
+	args.push("--tools", (agent.tools?.length ? agent.tools : DEFAULT_TOOLS).join(","));
+	args.push(`Task: ${job.task}`);
+
+	const result: RunResult = {
+		id: job.id,
+		name: job.name,
+		agent: agent.name,
+		source: agent.source,
+		task: job.task,
+		status: "failed",
+		exitCode: 1,
+		output: "",
+		stderr: "",
+		messages: [],
+		model,
+	};
+
+	try {
+		let wasAborted = false;
+		const exitCode = await new Promise<number>((resolve) => {
+			const invocation = getPiInvocation(args);
+			addJobLog(job, `spawn ${invocation.command} ${invocation.args.slice(0, -1).join(" ")} <task>`);
+			const child = spawn(invocation.command, invocation.args, {
+				cwd: taskCwd ?? cwd,
+				shell: false,
+				stdio: ["ignore", "pipe", "pipe"],
+				env: { ...process.env, PI_SUBAGENT: "1", PI_SUBAGENT_ID: job.id, PI_SUBAGENT_NAME: job.name },
+			});
+			job.status = "working";
+			job.updatedAt = Date.now();
+			addJobLog(job, `working in ${taskCwd ?? cwd}`);
+
+			let buffer = "";
+			const processLine = (line: string) => {
+				if (!line.trim()) return;
+				let event: any;
+				try {
+					event = JSON.parse(line);
+				} catch {
+					addJobLog(job, `stdout: ${truncateMiddle(line, 500)}`);
+					return;
+				}
+				logJsonEvent(job, event);
+				if (event.type === "message_end" && event.message) {
+					const message = event.message as Message;
+					result.messages.push(message);
+					if (message.role === "assistant") {
+						result.model = message.model ?? result.model;
+						result.stopReason = message.stopReason;
+						result.errorMessage = message.errorMessage;
+					}
+				}
+			};
+
+			child.stdout.on("data", (data) => {
+				buffer += data.toString();
+				const lines = buffer.split("\n");
+				buffer = lines.pop() ?? "";
+				for (const line of lines) processLine(line);
+			});
+			child.stderr.on("data", (data) => {
+				const text = data.toString();
+				result.stderr += text;
+				job.stderr += text;
+				addJobLog(job, `stderr: ${truncateMiddle(text.trim(), 500)}`);
+			});
+			child.on("error", (error) => {
+				result.errorMessage = error.message;
+				addJobLog(job, `process error: ${error.message}`);
+				resolve(1);
+			});
+			child.on("close", (code) => {
+				if (buffer.trim()) processLine(buffer);
+				resolve(code ?? 0);
+			});
+
+			const abort = () => {
+				wasAborted = true;
+				job.status = "aborted";
+				addJobLog(job, "abort requested");
+				child.kill("SIGTERM");
+				setTimeout(() => child.kill("SIGKILL"), 5_000).unref();
+			};
+			if (signal?.aborted) abort();
+			else signal?.addEventListener("abort", abort, { once: true });
+		});
+
+		result.exitCode = exitCode;
+		result.output = truncateOutput(getFinalAssistantOutput(result.messages) || result.errorMessage || result.stderr || "(no output)");
+		if (wasAborted) result.stopReason = "aborted";
+		result.status = wasAborted ? "aborted" : exitCode === 0 && result.stopReason !== "error" ? "done" : "failed";
+		job.status = result.status;
+		job.exitCode = exitCode;
+		job.output = result.output;
+		job.model = result.model;
+		job.stopReason = result.stopReason;
+		job.errorMessage = result.errorMessage;
+		job.finishedAt = Date.now();
+		job.updatedAt = job.finishedAt;
+		addJobLog(job, `${job.status} exit=${exitCode}`);
+		return result;
+	} finally {
+		await rm(tempDir, { recursive: true, force: true });
+	}
+}
+
+function isFailure(result: RunResult): boolean {
+	return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+}
+
+export default function subagentsExtension(pi: ExtensionAPI) {
+	pi.registerCommand("subagents", {
+		description: "List available subagent profiles",
+		handler: async (args, ctx) => {
+			const scope = (args.trim() || "config") as NonNullable<SubagentParams["scope"]>;
+			if (!["config", "user", "project", "all"].includes(scope)) {
+				ctx.ui.notify("Usage: /subagents [config|user|project|all]", "warning");
+				return;
+			}
+			const agents = discoverAgents(ctx.cwd, scope);
+			const text = agents.length
+				? agents.map((a) => `- ${a.name} (${a.source}): ${a.description}\n  ${a.filePath}`).join("\n")
+				: `No subagents found for scope: ${scope}`;
+			await ctx.ui.editor(`Subagents: ${scope}`, text);
+		},
+	});
+
+	pi.registerCommand("subagent-status", {
+		description: "Show recent subagent job status",
+		handler: async (_args, ctx) => {
+			await ctx.ui.editor("Subagent jobs", formatStatusBlock());
+		},
+	});
+
+	pi.registerCommand("subagent-log", {
+		description: "Show a subagent job log: /subagent-log <job-id-or-name>",
+		getArgumentCompletions: (prefix) =>
+			[...jobs.values()]
+				.filter((job) => job.id.startsWith(prefix) || job.name.startsWith(prefix))
+				.slice(0, 10)
+				.map((job) => ({ value: job.id, label: `${job.id} ${job.name} (${job.status})` })),
+		handler: async (args, ctx) => {
+			const query = args.trim();
+			if (!query) {
+				ctx.ui.notify("Usage: /subagent-log <job-id-or-name>", "warning");
+				return;
+			}
+			const job = findJob(query);
+			if (!job) {
+				ctx.ui.notify(`Unknown subagent job: ${query}`, "warning");
+				return;
+			}
+			const body = [
+				`${job.id} ${job.name}`,
+				`agent: ${job.agent}`,
+				`status: ${job.status}`,
+				`cwd: ${job.cwd}`,
+				`duration: ${formatDuration(job.startedAt, job.finishedAt)}`,
+				job.model ? `model: ${job.model}` : "",
+				job.exitCode !== undefined ? `exit: ${job.exitCode}` : "",
+				job.stopReason ? `stopReason: ${job.stopReason}` : "",
+				"",
+				"Task:",
+				job.task,
+				"",
+				"Log:",
+				job.logs.join("\n") || "(no log)",
+				job.output ? `\nOutput:\n${job.output}` : "",
+			]
+				.filter(Boolean)
+				.join("\n");
+			await ctx.ui.editor(`Subagent log: ${job.id}`, body);
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent",
+		label: "Subagent",
+		description:
+			"Delegate one task, or a small parallel batch, to named Markdown-defined Pi subagents with isolated context. Default scope is config agents from this pi-config repo.",
+		promptSnippet: "Delegate isolated research, review, or exploration work to a named subagent profile.",
+		promptGuidelines: [
+			"Use subagent when independent research/review/exploration can be done in an isolated context window.",
+			"Give each subagent job a short descriptive name when launching multiple subagents.",
+			"Use subagent only with a specific, self-contained task and include relevant paths or constraints.",
+		],
+		parameters: SubagentParamsSchema,
+		async execute(_toolCallId, params: SubagentParams, signal, onUpdate, ctx) {
+			const scope = params.scope ?? "config";
+			const agents = discoverAgents(ctx.cwd, scope);
+			const hasSingle = Boolean(params.agent && params.task);
+			const hasParallel = Boolean(params.tasks?.length);
+			if (Number(hasSingle) + Number(hasParallel) !== 1) {
+				return {
+					content: [{ type: "text", text: "Provide exactly one mode: agent+task or tasks[]." }],
+					details: { availableAgents: agents },
+					isError: true,
+				};
+			}
+
+			if ((scope === "project" || scope === "all") && !ctx.isProjectTrusted()) {
+				return {
+					content: [{ type: "text", text: "Project-local subagents require a trusted project." }],
+					details: { mode: "none" },
+					isError: true,
+				};
+			}
+
+			if ((scope === "project" || scope === "all") && (params.confirmProjectAgents ?? true)) {
+				const projectNames = agents.filter((agent) => agent.source === "project").map((agent) => agent.name);
+				if (projectNames.length > 0 && ctx.hasUI) {
+					const ok = await ctx.ui.confirm(
+						"Run project-local subagents?",
+						`Project agents are repository-controlled instructions. Agents: ${projectNames.join(", ")}`,
+					);
+					if (!ok) return { content: [{ type: "text", text: "Canceled." }], details: { mode: "none" } };
+				}
+			}
+
+			const run = async (item: { agent: string; task: string; cwd?: string; name?: string; model?: string }) => {
+				const cwdResult = validateCwd(ctx.cwd, item.cwd);
+				const job = createJob(item.agent, item.task, cwdResult.cwd, item.name);
+				if (cwdResult.error) {
+					job.status = "failed";
+					job.output = cwdResult.error;
+					job.exitCode = 1;
+					job.finishedAt = Date.now();
+					addJobLog(job, cwdResult.error);
+					return {
+						id: job.id,
+						name: job.name,
+						agent: item.agent,
+						task: item.task,
+						status: "failed",
+						exitCode: 1,
+						output: cwdResult.error,
+						stderr: "",
+						messages: [],
+					} satisfies RunResult;
+				}
+				const agent = agents.find((candidate) => candidate.name === item.agent);
+				if (!agent) {
+					const output = `Unknown agent. Available: ${agents.map((a) => a.name).join(", ") || "none"}`;
+					job.status = "failed";
+					job.output = output;
+					job.exitCode = 1;
+					job.finishedAt = Date.now();
+					addJobLog(job, output);
+					return {
+						id: job.id,
+						name: job.name,
+						agent: item.agent,
+						task: item.task,
+						status: "failed",
+						exitCode: 1,
+						output,
+						stderr: "",
+						messages: [],
+					} satisfies RunResult;
+				}
+				return runAgent(ctx.cwd, agent, job, cwdResult.cwd, item.model ?? params.model, signal);
+			};
+
+			if (hasSingle) {
+				onUpdate?.({
+					content: [{ type: "text", text: `Starting ${params.name ?? params.agent}...` }],
+					details: { mode: "single", jobs: formatStatusBlock() },
+				});
+				const result = await run({ agent: params.agent!, task: params.task!, cwd: undefined, name: params.name, model: params.model });
+				return {
+					content: [{ type: "text", text: `Subagent ${result.id} (${result.name}) ${result.status}\n\n${result.output}` }],
+					details: { mode: "single", result, job: jobs.get(result.id) },
+					isError: isFailure(result),
+				};
+			}
+
+			const tasks = params.tasks ?? [];
+			if (tasks.length > MAX_PARALLEL_TASKS) {
+				return {
+					content: [{ type: "text", text: `Too many tasks (${tasks.length}). Max is ${MAX_PARALLEL_TASKS}.` }],
+					details: { mode: "parallel", results: [] },
+					isError: true,
+				};
+			}
+
+			onUpdate?.({
+				content: [{ type: "text", text: `Starting ${tasks.length} subagents...` }],
+				details: { mode: "parallel", jobs: formatStatusBlock() },
+			});
+			const results = await Promise.all(
+				tasks.map(async (task) => {
+					const result = await run(task);
+					onUpdate?.({
+						content: [
+							{
+								type: "text",
+								text: `${result.id} (${result.name}) ${result.status}\n\n${formatStatusBlock([result])}`,
+							},
+						],
+						details: { mode: "parallel", jobs: formatStatusBlock([result]) },
+					});
+					return result;
+				}),
+			);
+			const succeeded = results.filter((result) => !isFailure(result)).length;
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Parallel subagents: ${succeeded}/${results.length} succeeded\n\n${results
+							.map(
+								(result) =>
+									`## ${result.id} ${result.name} — ${result.status}\n\nAgent: ${result.agent}\n\n${result.output}`,
+							)
+							.join("\n\n---\n\n")}`,
+					},
+				],
+				details: { mode: "parallel", results, jobs: results.map((result) => jobs.get(result.id)) },
+				isError: succeeded !== results.length,
+			};
+		},
+	});
+}
