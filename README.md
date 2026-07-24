@@ -8,6 +8,7 @@ This repo currently tracks:
 
 - custom Pi extensions I actually use
 - repo-local Pi skills that support those workflows
+- profile-based subagents with background spawn, inspection, waiting, and cancellation
 - setup notes for wiring this repo into Pi
 - a minimal example `settings.json` snippet
 - an inventory of third-party Pi extensions/packages I use
