@@ -24,6 +24,7 @@ import { extractTextResponse, truncateMiddle } from "../../utils/text.ts";
 import { discoverAgents, type AgentProfile, type AgentScope, type AgentSource } from "./profiles.ts";
 import { truncateOutput as truncateBoundedOutput } from "./output.ts";
 import { isTrustedChildCwd } from "./policy.ts";
+import { formatActivityStatus } from "./status.ts";
 import { ResultDelivery } from "./result-delivery.ts";
 
 const MAX_PARALLEL_TASKS = 4;
@@ -351,6 +352,14 @@ function isFailure(result: RunResult): boolean {
 export default function subagentsExtension(pi: ExtensionAPI) {
 	const resultDelivery = new ResultDelivery<RunResult>();
 	let sessionContext: ExtensionContext | undefined;
+	const updateStatus = () => {
+		const values = [...jobs.values()];
+		sessionContext?.ui.setStatus("subagents", formatActivityStatus({
+			running: values.filter((job) => job.status === "initializing" || job.status === "working").length,
+			done: values.filter((job) => job.status === "done").length,
+			failed: values.filter((job) => job.status === "failed" || job.status === "aborted").length,
+		}));
+	};
 	const flushResults = () => {
 		for (const result of resultDelivery.drain()) {
 			pi.sendMessage({
@@ -361,9 +370,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			}, { deliverAs: "followUp", triggerTurn: true });
 		}
 	};
-	pi.on("session_start", (_event, ctx) => { sessionContext = ctx; });
+	pi.on("session_start", (_event, ctx) => { sessionContext = ctx; updateStatus(); });
 	pi.on("agent_end", () => { flushResults(); });
-	pi.on("session_shutdown", () => { sessionContext = undefined; resultDelivery.clear(); });
+	pi.on("session_shutdown", () => { sessionContext?.ui.setStatus("subagents", undefined); sessionContext = undefined; resultDelivery.clear(); });
 
 	const startBackground = async (params: SubagentParams, ctx: ExtensionContext, signal: AbortSignal | undefined) => {
 		const scope = params.scope ?? "config";
@@ -386,6 +395,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		if (!agent) throw new Error(`Unknown agent. Available: ${agents.map((candidate) => candidate.name).join(", ") || "none"}`);
 		job.completion = runAgent(ctx.cwd, agent, job, cwdResult.cwd, params.model, signal);
 		job.completion.then((result) => {
+			updateStatus();
 			resultDelivery.defer(result);
 			if (sessionContext?.isIdle()) flushResults();
 		});
@@ -470,6 +480,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			const active = [...jobs.values()].filter((job) => job.status === "initializing" || job.status === "working").length;
 			if (active >= MAX_PARALLEL_TASKS) throw new Error(`Too many running subagents. Max is ${MAX_PARALLEL_TASKS}.`);
 			const job = await startBackground(params, ctx, signal);
+			updateStatus();
 			return { content: [{ type: "text", text: `Spawned ${job.id} (${job.name}). Continue working; use subagent_wait when its result is needed.` }], details: { id: job.id, status: job.status } };
 		},
 	});

@@ -4,11 +4,17 @@ import test from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { formatActivityStatus } from "../extensions/subagents/status.ts";
 import { isTrustedChildCwd } from "../extensions/subagents/policy.ts";
 import { truncateOutput } from "../extensions/subagents/output.ts";
 import { ResultDelivery } from "../extensions/subagents/result-delivery.ts";
 import { JobManager } from "../extensions/subagents/jobs.ts";
 import { discoverAgents, parseFrontmatter } from "../extensions/subagents/profiles.ts";
+
+test("activity status distinguishes active and failed subagents", () => {
+	assert.equal(formatActivityStatus({ running: 2, done: 1, failed: 0 }), "subagents: 2 running · 1 done");
+	assert.equal(formatActivityStatus({ running: 0, done: 0, failed: 1 }), "subagents: 1 failed");
+});
 
 test("child cwd policy keeps profile agents inside the trusted parent project", () => {
 	assert.equal(isTrustedChildCwd("/work/project", "/work/project"), true);
