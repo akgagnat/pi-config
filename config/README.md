@@ -26,7 +26,7 @@ Concrete examples:
 ```json
 {
   "extensions": [
-    "/home/akgagnat/Projects/pi-config/extensions/pr.ts"
+    "/home/akgagnat/Projects/pi-config/extensions"
   ],
   "skills": [
     "/home/akgagnat/Projects/pi-config/skills"
@@ -37,7 +37,7 @@ Concrete examples:
 ```json
 {
   "extensions": [
-    "/Users/akgagnat/Projects/pi-config/extensions/pr.ts"
+    "/Users/akgagnat/Projects/pi-config/extensions"
   ],
   "skills": [
     "/Users/akgagnat/Projects/pi-config/skills"
