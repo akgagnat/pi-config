@@ -17,7 +17,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
-import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { validateCwd } from "../../utils/cwd.ts";
 import { extractTextResponse, truncateMiddle } from "../../utils/text.ts";
@@ -48,6 +48,8 @@ type SubagentJob = {
 	output?: string;
 	stderr: string;
 	logs: string[];
+	completion?: Promise<RunResult>;
+	abort?: () => void;
 };
 
 type RunResult = {
@@ -79,6 +81,7 @@ const SubagentParamsSchema = Type.Object({
 	task: Type.Optional(Type.String({ description: "Task for single-task mode" })),
 	name: Type.Optional(Type.String({ description: "Human-readable name for the single subagent job" })),
 	model: Type.Optional(Type.String({ description: "Model to use for the subagent. Defaults to the main agent model." })),
+	cwd: Type.Optional(Type.String({ description: "Working directory for the subagent." })),
 	tasks: Type.Optional(Type.Array(TaskSchema, { description: "Small parallel batch of delegated tasks" })),
 	scope: Type.Optional(
 		Type.Union([Type.Literal("config"), Type.Literal("user"), Type.Literal("project"), Type.Literal("all")], {
@@ -311,6 +314,7 @@ async function runAgent(
 				child.kill("SIGTERM");
 				setTimeout(() => child.kill("SIGKILL"), 5_000).unref();
 			};
+			job.abort = abort;
 			if (signal?.aborted) abort();
 			else signal?.addEventListener("abort", abort, { once: true });
 		});
@@ -327,6 +331,7 @@ async function runAgent(
 		job.errorMessage = result.errorMessage;
 		job.finishedAt = Date.now();
 		job.updatedAt = job.finishedAt;
+		job.abort = undefined;
 		addJobLog(job, `${job.status} exit=${exitCode}`);
 		return result;
 	} finally {
@@ -339,6 +344,28 @@ function isFailure(result: RunResult): boolean {
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+	const startBackground = async (params: SubagentParams, ctx: ExtensionContext, signal: AbortSignal | undefined) => {
+		const scope = params.scope ?? "config";
+		const agents = discoverAgents(ctx.cwd, scope);
+		if (!params.agent || !params.task) throw new Error("agent and task are required.");
+		if ((scope === "project" || scope === "all") && !ctx.isProjectTrusted()) {
+			throw new Error("Project-local subagents require a trusted project.");
+		}
+		if ((scope === "project" || scope === "all") && (params.confirmProjectAgents ?? true) && ctx.hasUI) {
+			const projectNames = agents.filter((agent) => agent.source === "project").map((agent) => agent.name);
+			if (projectNames.length > 0 && !(await ctx.ui.confirm("Run project-local subagents?", `Project agents are repository-controlled instructions. Agents: ${projectNames.join(", ")}`))) {
+				throw new Error("Canceled.");
+			}
+		}
+		const cwdResult = validateCwd(ctx.cwd, params.cwd);
+		const job = createJob(params.agent, params.task, cwdResult.cwd, params.name);
+		if (cwdResult.error) throw new Error(cwdResult.error);
+		const agent = agents.find((candidate) => candidate.name === params.agent);
+		if (!agent) throw new Error(`Unknown agent. Available: ${agents.map((candidate) => candidate.name).join(", ") || "none"}`);
+		job.completion = runAgent(ctx.cwd, agent, job, cwdResult.cwd, params.model, signal);
+		return job;
+	};
+
 	pi.registerCommand("subagents", {
 		description: "List available subagent profiles",
 		handler: async (args, ctx) => {
@@ -404,8 +431,83 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
+		name: "subagent_spawn",
+		label: "Spawn Subagent",
+		description: "Start a named profile subagent in the background. Its result is available through subagent_wait; use subagent_check or subagent_list while it runs.",
+		promptSnippet: "Start a self-contained profile subagent in the background.",
+		promptGuidelines: [
+			"Use subagent_spawn for independent work that can continue while you work on other tasks.",
+			"Give subagent_spawn a self-contained task with relevant paths and the expected report.",
+		],
+		parameters: Type.Intersect([SubagentParamsSchema, Type.Object({ agent: Type.String(), task: Type.String() })]),
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const active = [...jobs.values()].filter((job) => job.status === "initializing" || job.status === "working").length;
+			if (active >= MAX_PARALLEL_TASKS) throw new Error(`Too many running subagents. Max is ${MAX_PARALLEL_TASKS}.`);
+			const job = await startBackground(params, ctx, signal);
+			return { content: [{ type: "text", text: `Spawned ${job.id} (${job.name}). Continue working; use subagent_wait when its result is needed.` }], details: { id: job.id, status: job.status } };
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_check",
+		label: "Check Subagent",
+		description: "Inspect a background subagent's status and recent log without waiting.",
+		parameters: Type.Object({ id: Type.String({ description: "Subagent job id" }) }),
+		async execute(_toolCallId, params) {
+			const job = jobs.get(params.id);
+			if (!job) throw new Error(`Unknown subagent job: ${params.id}`);
+			return { content: [{ type: "text", text: `${formatJobSummary(job)}\n\n${job.logs.slice(-10).join("\n") || "(no log yet)"}` }], details: { id: job.id, status: job.status } };
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_list",
+		label: "List Subagents",
+		description: "List running and recently completed background subagents.",
+		parameters: Type.Object({}),
+		async execute() {
+			return { content: [{ type: "text", text: formatStatusBlock() }], details: { jobs: [...jobs.values()] } };
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_wait",
+		label: "Wait for Subagents",
+		description: "Wait for specified background subagents and return their final reports.",
+		parameters: Type.Object({ ids: Type.Array(Type.String(), { minItems: 1, description: "Subagent job ids" }) }),
+		async execute(_toolCallId, params, signal, onUpdate) {
+			const selected = params.ids.map((id) => {
+				const job = jobs.get(id);
+				if (!job?.completion) throw new Error(`Unknown subagent job: ${id}`);
+				return job;
+			});
+			if (signal?.aborted) throw new Error("Wait aborted. Subagents keep running.");
+			onUpdate?.({ content: [{ type: "text", text: `Waiting for ${params.ids.join(", ")}...` }], details: { ids: params.ids } });
+			const results = await Promise.all(selected.map((job) => job.completion!));
+			return { content: [{ type: "text", text: results.map((result) => `## ${result.id} ${result.name} — ${result.status}\n\n${result.output}`).join("\n\n---\n\n") }], details: { results }, isError: results.some(isFailure) };
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_cancel",
+		label: "Cancel Subagents",
+		description: "Cancel running background subagents while preserving their partial logs.",
+		parameters: Type.Object({ ids: Type.Array(Type.String(), { minItems: 1, description: "Subagent job ids" }) }),
+		async execute(_toolCallId, params) {
+			const lines = params.ids.map((id) => {
+				const job = jobs.get(id);
+				if (!job) throw new Error(`Unknown subagent job: ${id}`);
+				if (!job.abort) return `${id} was already ${job.status}.`;
+				job.abort();
+				return `Cancellation requested for ${id}.`;
+			});
+			return { content: [{ type: "text", text: lines.join("\n") }], details: { ids: params.ids } };
+		},
+	});
+
+	pi.registerTool({
 		name: "subagent",
-		label: "Subagent",
+		label: "Subagent", 
 		description:
 			"Delegate one task, or a small parallel batch, to named Markdown-defined Pi subagents with isolated context. Default scope is config agents from this pi-config repo.",
 		promptSnippet: "Delegate isolated research, review, or exploration work to a named subagent profile.",
@@ -496,7 +598,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					content: [{ type: "text", text: `Starting ${params.name ?? params.agent}...` }],
 					details: { mode: "single", jobs: formatStatusBlock() },
 				});
-				const result = await run({ agent: params.agent!, task: params.task!, cwd: undefined, name: params.name, model: params.model });
+				const result = await run({ agent: params.agent!, task: params.task!, cwd: params.cwd, name: params.name, model: params.model });
 				return {
 					content: [{ type: "text", text: `Subagent ${result.id} (${result.name}) ${result.status}\n\n${result.output}` }],
 					details: { mode: "single", result, job: jobs.get(result.id) },
