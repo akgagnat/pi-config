@@ -1,7 +1,7 @@
 {
   "extensions": [
     "/path/to/pi-config/extensions/pr.ts",
-    "/path/to/pi-config/extensions/subagents.ts"
+    "/path/to/pi-config/extensions/subagents/index.ts"
   ],
   "skills": [
     "/path/to/pi-config/skills"
