@@ -83,6 +83,48 @@ test("an unavailable profile does not leave an initializing background job", asy
 	assert.doesNotThrow(() => structuredClone(listing.details));
 });
 
+test("subagents-status returns to the job list after closing a selected log", async () => {
+	const tools = new Map<string, any>();
+	const commands = new Map<string, any>();
+	subagentsExtension({
+		on() {},
+		registerTool(tool: any) { tools.set(tool.name, tool); },
+		registerCommand(name: string, command: any) { commands.set(name, command); },
+		sendMessage() {},
+	} as any);
+	const baseCtx = {
+		cwd: process.cwd(),
+		hasUI: false,
+		isProjectTrusted: () => true,
+		isIdle: () => false,
+		ui: { setStatus() {} },
+	};
+	const result = await tools.get("subagent").execute(
+		"call",
+		{ agent: "missing", task: "do work" },
+		undefined,
+		undefined,
+		baseCtx,
+	);
+	const id = result.details.result.id;
+	const selections = [id, null];
+	const editors: Array<{ title: string; body: string }> = [];
+	await commands.get("subagents-status").handler("", {
+		...baseCtx,
+		mode: "tui",
+		ui: {
+			...baseCtx.ui,
+			notify() {},
+			custom: async () => selections.shift(),
+			editor: async (title: string, body: string) => { editors.push({ title, body }); },
+		},
+	});
+	assert.equal(commands.has("subagent-log"), false);
+	assert.equal(editors.length, 1);
+	assert.equal(editors[0].title, `Subagent log: ${id}`);
+	assert.match(editors[0].body, /Unknown agent/);
+});
+
 test("job manager lets callers inspect work before collecting its result", async () => {
 	let finish!: (value: string) => void;
 	const manager = new JobManager<string>(1, () => "sa-1");

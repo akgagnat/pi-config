@@ -17,7 +17,8 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
-import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Container, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { validateCwd } from "../../utils/cwd.ts";
 import { extractTextResponse, truncateMiddle } from "../../utils/text.ts";
@@ -168,15 +169,79 @@ function formatJobSummary(job: SubagentJob): string {
 	return `- ${job.id} ${job.status.padEnd(12)} ${job.name} [${job.agent}] ${duration}${suffix}`;
 }
 
-function formatStatusBlock(activeResults?: RunResult[]): string {
-	const activeIds = new Set(activeResults?.map((result) => result.id));
-	const recent = [...jobs.values()]
+function recentJobs(): SubagentJob[] {
+	return [...jobs.values()]
 		.sort((a, b) => b.startedAt - a.startedAt)
 		.slice(0, 20);
+}
+
+function formatStatusBlock(activeResults?: RunResult[]): string {
+	const activeIds = new Set(activeResults?.map((result) => result.id));
+	const recent = recentJobs();
 	if (recent.length === 0) return "No subagent jobs yet.";
 	return recent
 		.map((job) => `${activeIds.has(job.id) ? "*" : " "} ${formatJobSummary(job)}`)
 		.join("\n");
+}
+
+function formatJobLog(job: SubagentJob): string {
+	return [
+		`${job.id} ${job.name}`,
+		`agent: ${job.agent}`,
+		`status: ${job.status}`,
+		`cwd: ${job.cwd}`,
+		`duration: ${formatDuration(job.startedAt, job.finishedAt)}`,
+		job.model ? `model: ${job.model}` : "",
+		job.exitCode !== undefined ? `exit: ${job.exitCode}` : "",
+		job.stopReason ? `stopReason: ${job.stopReason}` : "",
+		"",
+		"Task:",
+		job.task,
+		"",
+		"Log:",
+		job.logs.join("\n") || "(no log)",
+		job.output ? `\nOutput:\n${job.output}` : "",
+	]
+		.filter(Boolean)
+		.join("\n");
+}
+
+async function selectSubagentJob(ctx: ExtensionContext): Promise<string | null> {
+	const recent = recentJobs();
+	if (recent.length === 0) {
+		ctx.ui.notify("No subagent jobs yet.", "info");
+		return null;
+	}
+	const items: SelectItem[] = recent.map((job) => ({
+		value: job.id,
+		label: `${job.id} ${job.name}`,
+		description: `${job.status} · ${job.agent} · ${formatDuration(job.startedAt, job.finishedAt)}`,
+	}));
+	return ctx.ui.custom<string | null>((tui, theme, _keybindings, done) => {
+		const container = new Container();
+		container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+		container.addChild(new Text(theme.fg("accent", theme.bold("Subagent jobs")), 1, 0));
+		const list = new SelectList(items, Math.min(items.length, 12), {
+			selectedPrefix: (text) => theme.fg("accent", text),
+			selectedText: (text) => theme.fg("accent", text),
+			description: (text) => theme.fg("muted", text),
+			scrollInfo: (text) => theme.fg("dim", text),
+			noMatch: (text) => theme.fg("warning", text),
+		});
+		list.onSelect = (item) => done(item.value);
+		list.onCancel = () => done(null);
+		container.addChild(list);
+		container.addChild(new Text(theme.fg("dim", "↑↓ navigate • enter view log • esc close"), 1, 0));
+		container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+		return {
+			render: (width: number) => container.render(width),
+			invalidate: () => container.invalidate(),
+			handleInput: (data: string) => {
+				list.handleInput(data);
+				tui.requestRender();
+			},
+		};
+	});
 }
 
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
@@ -472,51 +537,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerCommand("subagent-status", {
-		description: "Show recent subagent job status",
+	pi.registerCommand("subagents-status", {
+		description: "Browse recent subagent jobs and their logs",
 		handler: async (_args, ctx) => {
-			await ctx.ui.editor("Subagent jobs", formatStatusBlock());
-		},
-	});
-
-	pi.registerCommand("subagent-log", {
-		description: "Show a subagent job log: /subagent-log <job-id-or-name>",
-		getArgumentCompletions: (prefix) =>
-			[...jobs.values()]
-				.filter((job) => job.id.startsWith(prefix) || job.name.startsWith(prefix))
-				.slice(0, 10)
-				.map((job) => ({ value: job.id, label: `${job.id} ${job.name} (${job.status})` })),
-		handler: async (args, ctx) => {
-			const query = args.trim();
-			if (!query) {
-				ctx.ui.notify("Usage: /subagent-log <job-id-or-name>", "warning");
+			if (ctx.mode !== "tui") {
+				await ctx.ui.editor("Subagent jobs", formatStatusBlock());
 				return;
 			}
-			const job = findJob(query);
-			if (!job) {
-				ctx.ui.notify(`Unknown subagent job: ${query}`, "warning");
-				return;
+			while (true) {
+				const id = await selectSubagentJob(ctx);
+				if (!id) return;
+				const job = jobs.get(id);
+				if (!job) continue;
+				await ctx.ui.editor(`Subagent log: ${job.id}`, formatJobLog(job));
 			}
-			const body = [
-				`${job.id} ${job.name}`,
-				`agent: ${job.agent}`,
-				`status: ${job.status}`,
-				`cwd: ${job.cwd}`,
-				`duration: ${formatDuration(job.startedAt, job.finishedAt)}`,
-				job.model ? `model: ${job.model}` : "",
-				job.exitCode !== undefined ? `exit: ${job.exitCode}` : "",
-				job.stopReason ? `stopReason: ${job.stopReason}` : "",
-				"",
-				"Task:",
-				job.task,
-				"",
-				"Log:",
-				job.logs.join("\n") || "(no log)",
-				job.output ? `\nOutput:\n${job.output}` : "",
-			]
-				.filter(Boolean)
-				.join("\n");
-			await ctx.ui.editor(`Subagent log: ${job.id}`, body);
 		},
 	});
 
