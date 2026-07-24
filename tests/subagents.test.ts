@@ -8,7 +8,8 @@ import { formatActivityStatus } from "../extensions/subagents/status.ts";
 import { isTrustedChildCwd } from "../extensions/subagents/policy.ts";
 import { truncateOutput } from "../extensions/subagents/output.ts";
 import { ResultDelivery } from "../extensions/subagents/result-delivery.ts";
-import { JobManager } from "../extensions/subagents/jobs.ts";
+import { JobManager, toJobSnapshot } from "../extensions/subagents/jobs.ts";
+import subagentsExtension from "../extensions/subagents/index.ts";
 import { discoverAgents, parseFrontmatter } from "../extensions/subagents/profiles.ts";
 
 test("activity status distinguishes active and failed subagents", () => {
@@ -40,6 +41,46 @@ test("result delivery defers completed jobs and lets an explicit wait consume th
 	assert.deepEqual(delivery.drain(), []);
 	delivery.defer({ id: "sa-3" });
 	assert.deepEqual(delivery.drain(), [{ id: "sa-3" }]);
+});
+
+test("subagent job details remain structured-cloneable while work is running", () => {
+	const details = toJobSnapshot({
+		id: "sa-1",
+		name: "research",
+		agent: "worker",
+		status: "working",
+		cwd: "/work/project",
+		startedAt: 1,
+		updatedAt: 2,
+		completion: Promise.resolve("report"),
+		abort: () => {},
+	} as any);
+	assert.deepEqual(structuredClone(details), details);
+	assert.deepEqual(Object.keys(details).sort(), ["agent", "cwd", "id", "name", "startedAt", "status", "updatedAt"]);
+});
+
+test("an unavailable profile does not leave an initializing background job", async () => {
+	const tools = new Map<string, any>();
+	subagentsExtension({
+		on() {},
+		registerTool(tool: any) { tools.set(tool.name, tool); },
+		registerCommand() {},
+		sendMessage() {},
+	} as any);
+	const ctx = {
+		cwd: process.cwd(),
+		hasUI: false,
+		isProjectTrusted: () => true,
+		isIdle: () => false,
+		ui: { setStatus() {} },
+	};
+	await assert.rejects(
+		tools.get("subagent_spawn").execute("call", { agent: "general", task: "do work" }, undefined, undefined, ctx),
+		/Unknown agent/,
+	);
+	const listing = await tools.get("subagent_list").execute();
+	assert.match(listing.content[0].text, /No subagent jobs yet/);
+	assert.doesNotThrow(() => structuredClone(listing.details));
 });
 
 test("job manager lets callers inspect work before collecting its result", async () => {

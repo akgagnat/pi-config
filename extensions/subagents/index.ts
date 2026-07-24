@@ -26,6 +26,7 @@ import { truncateOutput as truncateBoundedOutput } from "./output.ts";
 import { isTrustedChildCwd } from "./policy.ts";
 import { formatActivityStatus } from "./status.ts";
 import { ResultDelivery } from "./result-delivery.ts";
+import { type JobStatus, toJobSnapshot } from "./jobs.ts";
 
 const MAX_PARALLEL_TASKS = 4;
 const DEFAULT_TOOLS = ["read", "grep", "find", "ls"];
@@ -33,8 +34,6 @@ const OUTPUT_CAP_BYTES = 20_000;
 const OUTPUT_CAP_LINES = 600;
 const LOG_CAP_CHARS = 40_000;
 const JOB_TIMEOUT_MS = 15 * 60_000;
-
-type JobStatus = "initializing" | "working" | "done" | "failed" | "aborted";
 
 type AgentConfig = AgentProfile;
 type SubagentJob = {
@@ -55,6 +54,7 @@ type SubagentJob = {
 	stderr: string;
 	logs: string[];
 	completion?: Promise<RunResult>;
+	abortController: AbortController;
 	abort?: () => void;
 };
 
@@ -137,6 +137,14 @@ function createJob(agent: string, task: string, cwd: string, requestedName?: str
 		updatedAt: Date.now(),
 		stderr: "",
 		logs: [],
+		abortController: new AbortController(),
+	};
+	job.abort = () => {
+		if (job.status === "done" || job.status === "failed" || job.status === "aborted") return;
+		job.status = "aborted";
+		job.updatedAt = Date.now();
+		addJobLog(job, "abort requested");
+		job.abortController.abort();
 	};
 	addJobLog(job, `created job ${id} (${name})`);
 	jobs.set(id, job);
@@ -223,17 +231,9 @@ async function runAgent(
 	requestedModel: string | undefined,
 	signal: AbortSignal | undefined,
 ): Promise<RunResult> {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-subagent-"));
-	const promptPath = join(tempDir, `${agent.name.replace(/[^A-Za-z0-9_.-]+/g, "_")}.md`);
-	await writeFile(promptPath, agent.systemPrompt, { encoding: "utf8", mode: 0o600 });
-
 	const model = requestedModel?.trim() || agent.model?.trim() || process.env.PI_MODEL?.trim();
 	job.model = model;
-
-	const args = ["--mode", "json", "-p", "--no-session", "--name", job.name, "--append-system-prompt", promptPath];
-	if (model) args.push("--model", model);
-	args.push("--tools", (agent.tools?.length ? agent.tools : DEFAULT_TOOLS).join(","));
-	args.push(`Task: ${job.task}`);
+	let tempDir: string | undefined;
 
 	const result: RunResult = {
 		id: job.id,
@@ -250,6 +250,28 @@ async function runAgent(
 	};
 
 	try {
+		tempDir = await mkdtemp(join(tmpdir(), "pi-subagent-"));
+		const promptPath = join(tempDir, `${agent.name.replace(/[^A-Za-z0-9_.-]+/g, "_")}.md`);
+		await writeFile(promptPath, agent.systemPrompt, { encoding: "utf8", mode: 0o600 });
+		const args = ["--mode", "json", "-p", "--no-session", "--name", job.name, "--append-system-prompt", promptPath];
+		if (model) args.push("--model", model);
+		args.push("--tools", (agent.tools?.length ? agent.tools : DEFAULT_TOOLS).join(","));
+		args.push(`Task: ${job.task}`);
+		const abortSignal = signal ? AbortSignal.any([signal, job.abortController.signal]) : job.abortController.signal;
+		if (abortSignal.aborted) {
+			result.status = "aborted";
+			result.stopReason = "aborted";
+			result.output = "Cancelled before starting.";
+			job.status = result.status;
+			job.output = result.output;
+			job.stopReason = result.stopReason;
+			job.exitCode = 1;
+			job.finishedAt = Date.now();
+			job.updatedAt = job.finishedAt;
+			job.abort = undefined;
+			addJobLog(job, "aborted before starting");
+			return result;
+		}
 		let wasAborted = false;
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
@@ -316,13 +338,12 @@ async function runAgent(
 			const abort = () => {
 				wasAborted = true;
 				job.status = "aborted";
-				addJobLog(job, "abort requested");
+				job.updatedAt = Date.now();
 				child.kill("SIGTERM");
 				setTimeout(() => child.kill("SIGKILL"), 5_000).unref();
 			};
-			job.abort = abort;
-			if (signal?.aborted) abort();
-			else signal?.addEventListener("abort", abort, { once: true });
+			if (abortSignal.aborted) abort();
+			else abortSignal.addEventListener("abort", abort, { once: true });
 		});
 
 		result.exitCode = exitCode;
@@ -340,13 +361,45 @@ async function runAgent(
 		job.abort = undefined;
 		addJobLog(job, `${job.status} exit=${exitCode}`);
 		return result;
+	} catch (error) {
+		const errorMessage = error instanceof Error ? error.message : String(error);
+		const aborted = signal?.aborted || job.abortController.signal.aborted;
+		result.status = aborted ? "aborted" : "failed";
+		result.stopReason = aborted ? "aborted" : "error";
+		result.errorMessage = errorMessage;
+		result.output = aborted ? "Cancelled before starting." : errorMessage;
+		job.status = result.status;
+		job.exitCode = 1;
+		job.stopReason = result.stopReason;
+		job.errorMessage = errorMessage;
+		job.output = result.output;
+		job.finishedAt = Date.now();
+		job.updatedAt = job.finishedAt;
+		job.abort = undefined;
+		addJobLog(job, `${job.status}: ${errorMessage}`);
+		return result;
 	} finally {
-		await rm(tempDir, { recursive: true, force: true });
+		if (tempDir) await rm(tempDir, { recursive: true, force: true }).catch((error) => {
+			addJobLog(job, `temporary-file cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+		});
 	}
 }
 
 function isFailure(result: RunResult): boolean {
 	return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+}
+
+function resultDetails(result: RunResult) {
+	return {
+		id: result.id,
+		name: result.name,
+		agent: result.agent,
+		status: result.status,
+		exitCode: result.exitCode,
+		...(result.model === undefined ? {} : { model: result.model }),
+		...(result.stopReason === undefined ? {} : { stopReason: result.stopReason }),
+		...(result.errorMessage === undefined ? {} : { errorMessage: result.errorMessage }),
+	};
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
@@ -388,11 +441,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			}
 		}
 		const cwdResult = validateCwd(ctx.cwd, params.cwd);
-		const job = createJob(params.agent, params.task, cwdResult.cwd, params.name);
 		if (cwdResult.error) throw new Error(cwdResult.error);
 		if (!isTrustedChildCwd(ctx.cwd, cwdResult.cwd)) throw new Error("cwd must be the trusted project directory or one of its descendants.");
 		const agent = agents.find((candidate) => candidate.name === params.agent);
 		if (!agent) throw new Error(`Unknown agent. Available: ${agents.map((candidate) => candidate.name).join(", ") || "none"}`);
+		const job = createJob(params.agent, params.task, cwdResult.cwd, params.name);
 		const inheritedModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 		job.completion = runAgent(ctx.cwd, agent, job, cwdResult.cwd, params.model ?? inheritedModel, signal);
 		job.completion.then((result) => {
@@ -504,7 +557,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		description: "List running and recently completed background subagents.",
 		parameters: Type.Object({}),
 		async execute() {
-			return { content: [{ type: "text", text: formatStatusBlock() }], details: { jobs: [...jobs.values()] } };
+			return { content: [{ type: "text", text: formatStatusBlock() }], details: { jobs: [...jobs.values()].map(toJobSnapshot) } };
 		},
 	});
 
@@ -523,7 +576,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			if (signal?.aborted) throw new Error("Wait aborted. Subagents keep running.");
 			onUpdate?.({ content: [{ type: "text", text: `Waiting for ${params.ids.join(", ")}...` }], details: { ids: params.ids } });
 			const results = await Promise.all(selected.map((job) => job.completion!));
-			return { content: [{ type: "text", text: results.map((result) => `## ${result.id} ${result.name} — ${result.status}\n\n${result.output}`).join("\n\n---\n\n") }], details: { results }, isError: results.some(isFailure) };
+			return {
+				content: [{ type: "text", text: results.map((result) => `## ${result.id} ${result.name} — ${result.status}\n\n${result.output}`).join("\n\n---\n\n") }],
+				details: { results: results.map(resultDetails) },
+				isError: results.some(isFailure),
+			};
 		},
 	});
 
@@ -540,6 +597,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				job.abort();
 				return `Cancellation requested for ${id}.`;
 			});
+			updateStatus();
 			return { content: [{ type: "text", text: lines.join("\n") }], details: { ids: params.ids } };
 		},
 	});
@@ -642,7 +700,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				const result = await run({ agent: params.agent!, task: params.task!, cwd: params.cwd, name: params.name, model: params.model });
 				return {
 					content: [{ type: "text", text: `Subagent ${result.id} (${result.name}) ${result.status}\n\n${result.output}` }],
-					details: { mode: "single", result, job: jobs.get(result.id) },
+					details: { mode: "single", result: resultDetails(result) },
 					isError: isFailure(result),
 				};
 			}
@@ -688,7 +746,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 							.join("\n\n---\n\n")}`,
 					},
 				],
-				details: { mode: "parallel", results, jobs: results.map((result) => jobs.get(result.id)) },
+				details: {
+					mode: "parallel",
+					results: results.map(resultDetails),
+					jobs: results.map((result) => toJobSnapshot(jobs.get(result.id)!)),
+				},
 				isError: succeeded !== results.length,
 			};
 		},

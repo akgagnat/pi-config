@@ -1,5 +1,36 @@
 export type JobStatus = "initializing" | "working" | "done" | "failed" | "aborted";
 
+/** A session-safe view: never expose callbacks, AbortControllers, or Promises in tool details. */
+export type JobSnapshot = {
+	id: string;
+	name: string;
+	agent: string;
+	status: JobStatus;
+	cwd: string;
+	startedAt: number;
+	updatedAt: number;
+	finishedAt?: number;
+	exitCode?: number;
+	stopReason?: string;
+	errorMessage?: string;
+};
+
+export function toJobSnapshot(job: JobSnapshot): JobSnapshot {
+	return {
+		id: job.id,
+		name: job.name,
+		agent: job.agent,
+		status: job.status,
+		cwd: job.cwd,
+		startedAt: job.startedAt,
+		updatedAt: job.updatedAt,
+		...(job.finishedAt === undefined ? {} : { finishedAt: job.finishedAt }),
+		...(job.exitCode === undefined ? {} : { exitCode: job.exitCode }),
+		...(job.stopReason === undefined ? {} : { stopReason: job.stopReason }),
+		...(job.errorMessage === undefined ? {} : { errorMessage: job.errorMessage }),
+	};
+}
+
 export type ManagedJob<T> = {
 	id: string;
 	name: string;
