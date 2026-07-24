@@ -22,6 +22,7 @@ import { Type, type Static } from "typebox";
 import { validateCwd } from "../../utils/cwd.ts";
 import { extractTextResponse, truncateMiddle } from "../../utils/text.ts";
 import { discoverAgents, type AgentProfile, type AgentScope, type AgentSource } from "./profiles.ts";
+import { ResultDelivery } from "./result-delivery.ts";
 
 const MAX_PARALLEL_TASKS = 4;
 const DEFAULT_TOOLS = ["read", "grep", "find", "ls"];
@@ -344,6 +345,22 @@ function isFailure(result: RunResult): boolean {
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+	const resultDelivery = new ResultDelivery<RunResult>();
+	let sessionContext: ExtensionContext | undefined;
+	const flushResults = () => {
+		for (const result of resultDelivery.drain()) {
+			pi.sendMessage({
+				customType: "subagent-result",
+				content: `Subagent ${result.id} (${result.name}) ${result.status}.\n\n${result.output}`,
+				display: true,
+				details: { id: result.id, status: result.status },
+			}, { deliverAs: "followUp", triggerTurn: true });
+		}
+	};
+	pi.on("session_start", (_event, ctx) => { sessionContext = ctx; });
+	pi.on("agent_end", () => { flushResults(); });
+	pi.on("session_shutdown", () => { sessionContext = undefined; resultDelivery.clear(); });
+
 	const startBackground = async (params: SubagentParams, ctx: ExtensionContext, signal: AbortSignal | undefined) => {
 		const scope = params.scope ?? "config";
 		const agents = discoverAgents(ctx.cwd, scope);
@@ -363,6 +380,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		const agent = agents.find((candidate) => candidate.name === params.agent);
 		if (!agent) throw new Error(`Unknown agent. Available: ${agents.map((candidate) => candidate.name).join(", ") || "none"}`);
 		job.completion = runAgent(ctx.cwd, agent, job, cwdResult.cwd, params.model, signal);
+		job.completion.then((result) => {
+			resultDelivery.defer(result);
+			if (sessionContext?.isIdle()) flushResults();
+		});
 		return job;
 	};
 
@@ -476,6 +497,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		description: "Wait for specified background subagents and return their final reports.",
 		parameters: Type.Object({ ids: Type.Array(Type.String(), { minItems: 1, description: "Subagent job ids" }) }),
 		async execute(_toolCallId, params, signal, onUpdate) {
+			resultDelivery.consume(params.ids);
 			const selected = params.ids.map((id) => {
 				const job = jobs.get(id);
 				if (!job?.completion) throw new Error(`Unknown subagent job: ${id}`);

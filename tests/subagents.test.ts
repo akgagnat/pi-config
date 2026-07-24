@@ -4,8 +4,18 @@ import test from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { ResultDelivery } from "../extensions/subagents/result-delivery.ts";
 import { JobManager } from "../extensions/subagents/jobs.ts";
 import { discoverAgents, parseFrontmatter } from "../extensions/subagents/profiles.ts";
+
+test("result delivery defers completed jobs and lets an explicit wait consume them", () => {
+	const delivery = new ResultDelivery<{ id: string }>();
+	delivery.defer({ id: "sa-1" });
+	delivery.consume(["sa-1"]);
+	assert.deepEqual(delivery.drain(), []);
+	delivery.defer({ id: "sa-2" });
+	assert.deepEqual(delivery.drain(), [{ id: "sa-2" }]);
+});
 
 test("job manager lets callers inspect work before collecting its result", async () => {
 	let finish!: (value: string) => void;
