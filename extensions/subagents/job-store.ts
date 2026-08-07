@@ -149,6 +149,25 @@ function byteSuffix(value: string, maxBytes: number): string {
 	return kept.reverse().join("");
 }
 
+function boundTelemetryEvent(event: TelemetryEvent): TelemetryEvent {
+	const clone = structuredClone(event);
+	if (clone.type === "text-delta") return { ...clone, delta: byteSuffix(clone.delta, 20_000) };
+	if (clone.type === "thinking-delta") return { ...clone, delta: byteSuffix(clone.delta, 10_000) };
+	if (clone.type === "assistant-message") return {
+		...clone,
+		text: bytePrefix(clone.text, 20_000),
+		...(clone.thinking ? { thinking: bytePrefix(clone.thinking, 10_000) } : {}),
+	};
+	if (clone.type === "tool-start" && Buffer.byteLength(JSON.stringify(clone.args), "utf8") > 8_000) {
+		return { ...clone, args: "[tool arguments omitted: over 8KB]" };
+	}
+	if (clone.type === "tool-update" && Buffer.byteLength(JSON.stringify(clone.partialResult), "utf8") > 8_000) {
+		return { ...clone, partialResult: "[partial tool result omitted: over 8KB]" };
+	}
+	if (clone.type === "activity") return { ...clone, message: bytePrefix(clone.message, 2_000) };
+	return clone;
+}
+
 function cloneAndFreeze<T>(value: T): T {
 	const clone = structuredClone(value);
 	const freeze = (current: unknown): void => {
@@ -218,8 +237,16 @@ export class JobStore {
 
 	update(id: string, patch: JobUpdate): JobSnapshot {
 		const job = this.requireJob(id);
-		if (isTerminal(job.status) && patch.status !== undefined && patch.status !== job.status) {
-			throw new Error(`Completed subagent job cannot transition from ${job.status} to ${patch.status}.`);
+		if (patch.status !== undefined && patch.status !== job.status) {
+			const allowed = job.status === "initializing"
+				? patch.status === "working" || isTerminal(patch.status)
+				: job.status === "working"
+					? isTerminal(patch.status)
+					: false;
+			if (!allowed) throw new Error(`Subagent job cannot transition from ${job.status} to ${patch.status}.`);
+		}
+		if (patch.finishedAt !== undefined && !isTerminal(patch.status ?? job.status)) {
+			throw new Error("Only a terminal subagent job can have finishedAt.");
 		}
 		const wasTerminal = isTerminal(job.status);
 		Object.assign(job, structuredClone(patch));
@@ -236,7 +263,17 @@ export class JobStore {
 
 	appendTimeline(id: string, event: TelemetryEvent): JobSnapshot {
 		const job = this.requireJob(id);
-		job.timeline.push(structuredClone(event));
+		const bounded = boundTelemetryEvent(event);
+		const previous = job.timeline.at(-1);
+		if (bounded.type === "text-delta" && previous?.type === "text-delta" && previous.contentIndex === bounded.contentIndex) {
+			previous.delta = byteSuffix(previous.delta + bounded.delta, 20_000);
+			previous.at = bounded.at;
+		} else if (bounded.type === "thinking-delta" && previous?.type === "thinking-delta" && previous.contentIndex === bounded.contentIndex) {
+			previous.delta = byteSuffix(previous.delta + bounded.delta, 10_000);
+			previous.at = bounded.at;
+		} else {
+			job.timeline.push(bounded);
+		}
 		if (job.timeline.length > this.maxTimelineEvents) {
 			const dropped = job.timeline.length - this.maxTimelineEvents;
 			job.timeline.splice(0, dropped);

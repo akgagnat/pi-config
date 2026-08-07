@@ -101,6 +101,18 @@ test("timeline, stderr, and output retention stay within configured bounds", () 
 	});
 });
 
+test("streaming telemetry is coalesced and large payloads are bounded", () => {
+	const store = new JobStore({ now: () => 1 });
+	store.create(jobInput("sa-1"));
+	store.appendTimeline("sa-1", { type: "text-delta", contentIndex: 0, delta: "a", at: 1 });
+	store.appendTimeline("sa-1", { type: "text-delta", contentIndex: 0, delta: "b", at: 2 });
+	store.appendTimeline("sa-1", { type: "tool-start", id: "tool", name: "bash", args: { command: "x".repeat(9_000) }, at: 3 });
+	const snapshot = store.get("sa-1")!;
+	assert.equal(snapshot.timeline.length, 2);
+	assert.deepEqual(snapshot.timeline[0], { type: "text-delta", contentIndex: 0, delta: "ab", at: 2 });
+	assert.equal(snapshot.timeline[1].type === "tool-start" ? snapshot.timeline[1].args : undefined, "[tool arguments omitted: over 8KB]");
+});
+
 test("completed-job eviction removes the oldest completion without evicting active jobs", () => {
 	let now = 10;
 	const store = new JobStore({ maxCompletedJobs: 2, now: () => now++ });
