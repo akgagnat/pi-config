@@ -71,6 +71,26 @@ test("RPC client automatically cancels child extension dialogs", async () => {
 	client.dispose();
 });
 
+test("RPC client does not respond to fire-and-forget extension UI", () => {
+	const child = fakeChild();
+	const client = new RpcProcessClient(child);
+	let writes = 0;
+	child.stdin.on("data", () => writes++);
+	child.stdout.write('{"type":"extension_ui_request","id":"ui-1","method":"notify"}\n');
+	assert.equal(writes, 0);
+	client.dispose();
+});
+
+test("RPC client treats malformed protocol records as fatal", async () => {
+	const child = fakeChild();
+	const client = new RpcProcessClient(child);
+	const request = client.getState();
+	child.stdout.write("not-json\n");
+	await assert.rejects(request, /Invalid JSON/);
+	assert.deepEqual(child.killSignals, ["SIGTERM"]);
+	client.dispose();
+});
+
 test("RPC client terminates an oversized unterminated frame", () => {
 	const child = fakeChild();
 	const client = new RpcProcessClient(child, { maxFrameBytes: 8 });

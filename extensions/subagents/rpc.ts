@@ -91,6 +91,12 @@ export class RpcProcessClient {
 				reject(new Error(`Timed out waiting for subagent settlement after ${timeoutMs}ms.`));
 			}, timeoutMs);
 			const unsubscribe = this.onEvent((event) => {
+				if (event.type === "transport_error") {
+					clearTimeout(timeout);
+					unsubscribe();
+					reject(new Error(event.message));
+					return;
+				}
 				if (event.type !== "agent_settled") return;
 				clearTimeout(timeout);
 				unsubscribe();
@@ -159,6 +165,10 @@ export class RpcProcessClient {
 			}
 			this.processLine(line);
 		}
+		if (Buffer.byteLength(this.buffer, "utf8") > maxFrameBytes) {
+			this.fail(new Error(`Subagent RPC frame exceeded ${maxFrameBytes} bytes.`));
+			this.child.kill("SIGTERM");
+		}
 	};
 
 	private readonly handleEnd = (): void => {
@@ -185,7 +195,8 @@ export class RpcProcessClient {
 		try {
 			value = JSON.parse(line);
 		} catch {
-			this.emit({ type: "transport_error", message: `Invalid JSON from subagent: ${line.slice(0, 120)}` });
+			this.fail(new Error(`Invalid JSON from subagent: ${line.slice(0, 120)}`));
+			this.child.kill("SIGTERM");
 			return;
 		}
 		if (value.type === "response" && typeof value.id === "string") {
@@ -196,7 +207,11 @@ export class RpcProcessClient {
 			pending.resolve(value as RpcResponse);
 			return;
 		}
-		if (value.type === "extension_ui_request" && typeof value.id === "string") {
+		if (
+			value.type === "extension_ui_request"
+			&& typeof value.id === "string"
+			&& ["select", "confirm", "input", "editor"].includes(value.method)
+		) {
 			this.child.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: value.id, cancelled: true })}\n`);
 		}
 		if (value && typeof value.type === "string") this.emit(value as RpcProcessEvent);
@@ -207,7 +222,10 @@ export class RpcProcessClient {
 	}
 
 	private fail(error: Error): void {
-		if (!this.closedError) this.closedError = error;
+		if (!this.closedError) {
+			this.closedError = error;
+			this.emit({ type: "transport_error", message: error.message });
+		}
 		for (const pending of this.pending.values()) {
 			clearTimeout(pending.timeout);
 			pending.reject(this.closedError);

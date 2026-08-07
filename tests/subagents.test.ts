@@ -72,6 +72,7 @@ test("an unavailable profile does not leave an initializing background job", asy
 		hasUI: false,
 		isProjectTrusted: () => true,
 		isIdle: () => false,
+		sessionManager: { getSessionId: () => "test-session" },
 		ui: { setStatus() {} },
 	};
 	await assert.rejects(
@@ -83,7 +84,7 @@ test("an unavailable profile does not leave an initializing background job", asy
 	assert.doesNotThrow(() => structuredClone(listing.details));
 });
 
-test("subagents-status returns to the job list after closing a selected log", async () => {
+test("subagents-status opens the read-only live inspector", async () => {
 	const tools = new Map<string, any>();
 	const commands = new Map<string, any>();
 	subagentsExtension({
@@ -97,6 +98,7 @@ test("subagents-status returns to the job list after closing a selected log", as
 		hasUI: false,
 		isProjectTrusted: () => true,
 		isIdle: () => false,
+		sessionManager: { getSessionId: () => "test-session" },
 		ui: { setStatus() {} },
 	};
 	const result = await tools.get("subagent").execute(
@@ -107,22 +109,19 @@ test("subagents-status returns to the job list after closing a selected log", as
 		baseCtx,
 	);
 	const id = result.details.result.id;
-	const selections = [id, null];
-	const editors: Array<{ title: string; body: string }> = [];
+	let customCalls = 0;
 	await commands.get("subagents-status").handler("", {
 		...baseCtx,
 		mode: "tui",
 		ui: {
 			...baseCtx.ui,
 			notify() {},
-			custom: async () => selections.shift(),
-			editor: async (title: string, body: string) => { editors.push({ title, body }); },
+			custom: async () => { customCalls++; },
 		},
 	});
 	assert.equal(commands.has("subagent-log"), false);
-	assert.equal(editors.length, 1);
-	assert.equal(editors[0].title, `Subagent log: ${id}`);
-	assert.match(editors[0].body, /Unknown agent/);
+	assert.equal(customCalls, 1);
+	assert.match(id, /^sa-/);
 });
 
 test("job manager lets callers inspect work before collecting its result", async () => {

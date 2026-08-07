@@ -1,8 +1,8 @@
 /*
  * Subagent extension design notes:
  * - This extension follows Pi's extension API shape: a default factory receives ExtensionAPI and registers commands/tools.
- * - Subagents are isolated by spawning a child `pi --mode json -p --no-session` process, appending the selected profile's
- *   Markdown body as a system prompt, and parsing JSON events from stdout for assistant messages, logs, and status.
+ * - Subagents are isolated by spawning a child `pi --mode rpc --no-session --no-extensions` process, appending the
+ *   selected profile's Markdown body as a system prompt, and reducing streamed RPC events into a bounded job store.
  * - Agent profiles are Markdown files with frontmatter (`name`, `description`, optional `tools`, optional `model`) and the
  *   body as the system prompt. Config agents live in this repo's `agents/`; user agents in Pi's global agent dir;
  *   project agents in nearest `.pi/agents`.
@@ -11,7 +11,7 @@
  *   propagate parent aborts to child processes.
  */
 
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -28,6 +28,9 @@ import { isTrustedChildCwd } from "./policy.ts";
 import { formatActivityStatus } from "./status.ts";
 import { ResultDelivery } from "./result-delivery.ts";
 import { type JobStatus, toJobSnapshot } from "./jobs.ts";
+import { JobStore, type JobDeliveryMetadata, type JobModelMetadata } from "./job-store.ts";
+import { RpcProcessClient, type RpcProcessEvent } from "./rpc.ts";
+import { openSubagentInspector } from "./inspector.ts";
 
 const MAX_PARALLEL_TASKS = 4;
 const DEFAULT_TOOLS = ["read", "grep", "find", "ls"];
@@ -103,6 +106,8 @@ const SubagentParamsSchema = Type.Object({
 type SubagentParams = Static<typeof SubagentParamsSchema>;
 
 const jobs = new Map<string, SubagentJob>();
+const deliverySuppressed = new Set<string>();
+const jobStore = new JobStore();
 let nextJobNumber = 1;
 
 function nowIso(): string {
@@ -114,19 +119,42 @@ function makeJobId(): string {
 }
 
 function addJobLog(job: SubagentJob, line: string): void {
+	const at = Date.now();
 	job.logs.push(`[${nowIso()}] ${line}`);
 	let combined = job.logs.join("\n");
 	while (combined.length > LOG_CAP_CHARS && job.logs.length > 1) {
 		job.logs.shift();
 		combined = job.logs.join("\n");
 	}
-	job.updatedAt = Date.now();
+	job.updatedAt = at;
+	if (jobStore.get(job.id)) {
+		jobStore.appendTimeline(job.id, { type: "activity", message: line, at });
+		jobStore.update(job.id, {
+			status: job.status,
+			...(job.finishedAt === undefined ? {} : { finishedAt: job.finishedAt }),
+			...(job.exitCode === undefined ? {} : { exitCode: job.exitCode }),
+			...(job.stopReason === undefined ? {} : { stopReason: job.stopReason }),
+			...(job.errorMessage === undefined ? {} : { errorMessage: job.errorMessage }),
+		});
+	}
 }
 
-function createJob(agent: string, task: string, cwd: string, requestedName?: string): SubagentJob {
+function createJob(
+	agent: string,
+	task: string,
+	cwd: string,
+	requestedName?: string,
+	metadata: {
+		parentSessionId?: string;
+		toolCallId?: string;
+		model?: JobModelMetadata;
+		delivery?: JobDeliveryMetadata;
+	} = {},
+): SubagentJob {
 	const id = makeJobId();
 	const taskPreview = task.replace(/\s+/g, " ").trim().slice(0, 48);
 	const name = requestedName?.trim() || `${agent}:${taskPreview || id}`;
+	const startedAt = Date.now();
 	const job: SubagentJob = {
 		id,
 		name,
@@ -134,17 +162,27 @@ function createJob(agent: string, task: string, cwd: string, requestedName?: str
 		task,
 		cwd,
 		status: "initializing",
-		startedAt: Date.now(),
-		updatedAt: Date.now(),
+		startedAt,
+		updatedAt: startedAt,
 		stderr: "",
 		logs: [],
 		abortController: new AbortController(),
 	};
+	jobStore.create({
+		id,
+		name,
+		agent,
+		task,
+		cwd,
+		parent: { sessionId: metadata.parentSessionId, toolCallId: metadata.toolCallId },
+		model: metadata.model ?? { source: "default" },
+		delivery: metadata.delivery ?? { mode: "foreground", method: "tool-result", consumedByWait: false },
+		startedAt,
+	});
 	job.abort = () => {
-		if (job.status === "done" || job.status === "failed" || job.status === "aborted") return;
-		job.status = "aborted";
+		if (job.status === "done" || job.status === "failed" || job.status === "aborted" || job.abortController.signal.aborted) return;
 		job.updatedAt = Date.now();
-		addJobLog(job, "abort requested");
+		addJobLog(job, "cancellation requested");
 		job.abortController.abort();
 	};
 	addJobLog(job, `created job ${id} (${name})`);
@@ -173,6 +211,16 @@ function recentJobs(): SubagentJob[] {
 	return [...jobs.values()]
 		.sort((a, b) => b.startedAt - a.startedAt)
 		.slice(0, 20);
+}
+
+function pruneCompletedJobs(): void {
+	const completed = [...jobs.values()]
+		.filter((job) => job.status === "done" || job.status === "failed" || job.status === "aborted")
+		.sort((a, b) => (b.finishedAt ?? b.updatedAt) - (a.finishedAt ?? a.updatedAt));
+	for (const job of completed.slice(20)) {
+		jobs.delete(job.id);
+		deliverySuppressed.delete(job.id);
+	}
 }
 
 function formatStatusBlock(activeResults?: RunResult[]): string {
@@ -260,6 +308,24 @@ function getFinalAssistantOutput(messages: Message[]): string {
 	return "";
 }
 
+function resolveJobModel(
+	taskModel: string | undefined,
+	requestModel: string | undefined,
+	profileModel: string | undefined,
+	parentModel: string | undefined,
+): JobModelMetadata {
+	const choices = [
+		[taskModel, "task"],
+		[requestModel, "request"],
+		[profileModel, "profile"],
+		[parentModel, "parent"],
+	] as const;
+	for (const [candidate, source] of choices) {
+		const requested = candidate?.trim();
+		if (requested) return { requested, source };
+	}
+	return { source: "default" };
+}
 
 function logJsonEvent(job: SubagentJob, event: any): void {
 	if (event.type === "message_start" && event.message?.role) {
@@ -288,18 +354,79 @@ function logJsonEvent(job: SubagentJob, event: any): void {
 	if (event.type === "agent_end") addJobLog(job, "agent_end");
 }
 
-async function runAgent(
+function recordRpcEvent(job: SubagentJob, result: RunResult, event: RpcProcessEvent): void {
+	const at = Date.now();
+	if (event.type === "transport_error") {
+		addJobLog(job, event.message);
+		return;
+	}
+	if (event.type === "message_update") {
+		const update = event.assistantMessageEvent;
+		if (update.type === "text_delta") {
+			jobStore.appendTimeline(job.id, { type: "text-delta", contentIndex: update.contentIndex, delta: update.delta, at });
+		} else if (update.type === "thinking_delta") {
+			jobStore.appendTimeline(job.id, { type: "thinking-delta", contentIndex: update.contentIndex, delta: update.delta, at });
+		}
+		return;
+	}
+	if (event.type === "message_end") {
+		const message = event.message as Message;
+		result.messages.push(message);
+		if (result.messages.length > 100) result.messages.shift();
+		if (message.role === "assistant") {
+			result.model = message.model ?? result.model;
+			result.stopReason = message.stopReason;
+			result.errorMessage = message.errorMessage;
+			const text = message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+			const thinking = message.content.filter((part) => part.type === "thinking").map((part) => part.thinking).join("\n");
+			jobStore.appendTimeline(job.id, { type: "assistant-message", text, ...(thinking ? { thinking } : {}), at });
+			if (message.usage) jobStore.appendTimeline(job.id, { type: "usage", usage: message.usage, contextQuality: "exact", at });
+		}
+		logJsonEvent(job, event);
+		return;
+	}
+	if (event.type === "turn_start") {
+		const turn = (jobStore.get(job.id)?.timeline.filter((item) => item.type === "turn-start").length ?? 0) + 1;
+		jobStore.appendTimeline(job.id, { type: "turn-start", turn, at });
+		return;
+	}
+	if (event.type === "turn_end") {
+		const turn = jobStore.get(job.id)?.timeline.filter((item) => item.type === "turn-start").length ?? 0;
+		jobStore.appendTimeline(job.id, { type: "turn-end", turn, at });
+		return;
+	}
+	if (event.type === "tool_execution_start") {
+		jobStore.appendTimeline(job.id, { type: "tool-start", id: event.toolCallId, name: event.toolName, args: event.args, at });
+		addJobLog(job, `tool ${event.toolName} started`);
+		return;
+	}
+	if (event.type === "tool_execution_update") {
+		jobStore.appendTimeline(job.id, { type: "tool-update", id: event.toolCallId, partialResult: event.partialResult, at });
+		return;
+	}
+	if (event.type === "tool_execution_end") {
+		jobStore.appendTimeline(job.id, { type: "tool-end", id: event.toolCallId, name: event.toolName, isError: event.isError, at });
+		addJobLog(job, `tool ${event.toolName} finished${event.isError ? " with error" : ""}`);
+		return;
+	}
+	if (event.type === "auto_retry_start") {
+		jobStore.appendTimeline(job.id, { type: "retry", attempt: event.attempt, maxAttempts: event.maxAttempts, delayMs: event.delayMs, at });
+		return;
+	}
+	if (event.type === "compaction_start" || event.type === "compaction_end") {
+		jobStore.appendTimeline(job.id, { type: "compaction", phase: event.type === "compaction_start" ? "start" : "end", reason: event.reason, at });
+	}
+}
+
+async function runRpcAgent(
 	cwd: string,
 	agent: AgentConfig,
 	job: SubagentJob,
 	taskCwd: string | undefined,
-	requestedModel: string | undefined,
+	modelMetadata: JobModelMetadata,
 	signal: AbortSignal | undefined,
 ): Promise<RunResult> {
-	const model = requestedModel?.trim() || agent.model?.trim() || process.env.PI_MODEL?.trim();
-	job.model = model;
 	let tempDir: string | undefined;
-
 	const result: RunResult = {
 		id: job.id,
 		name: job.name,
@@ -311,143 +438,136 @@ async function runAgent(
 		output: "",
 		stderr: "",
 		messages: [],
-		model,
+		model: modelMetadata.requested,
 	};
-
+	let child: ReturnType<typeof spawn> | undefined;
+	let client: RpcProcessClient | undefined;
+	let wasAborted = false;
+	let statsRefreshPending = false;
+	let unsubscribeRpc: (() => void) | undefined;
+	let abortSignal: AbortSignal | undefined;
+	let abortHandler: (() => void) | undefined;
+	let terminateTimer: NodeJS.Timeout | undefined;
+	let killTimer: NodeJS.Timeout | undefined;
 	try {
 		tempDir = await mkdtemp(join(tmpdir(), "pi-subagent-"));
 		const promptPath = join(tempDir, `${agent.name.replace(/[^A-Za-z0-9_.-]+/g, "_")}.md`);
 		await writeFile(promptPath, agent.systemPrompt, { encoding: "utf8", mode: 0o600 });
-		const args = ["--mode", "json", "-p", "--no-session", "--name", job.name, "--append-system-prompt", promptPath];
-		if (model) args.push("--model", model);
+		const args = ["--mode", "rpc", "--no-session", "--no-extensions", "--name", job.name, "--append-system-prompt", promptPath];
+		if (modelMetadata.requested) args.push("--model", modelMetadata.requested);
 		args.push("--tools", (agent.tools?.length ? agent.tools : DEFAULT_TOOLS).join(","));
-		args.push(`Task: ${job.task}`);
-		const abortSignal = signal ? AbortSignal.any([signal, job.abortController.signal]) : job.abortController.signal;
-		if (abortSignal.aborted) {
-			result.status = "aborted";
-			result.stopReason = "aborted";
-			result.output = "Cancelled before starting.";
-			job.status = result.status;
-			job.output = result.output;
-			job.stopReason = result.stopReason;
-			job.exitCode = 1;
-			job.finishedAt = Date.now();
-			job.updatedAt = job.finishedAt;
-			job.abort = undefined;
-			addJobLog(job, "aborted before starting");
-			return result;
-		}
-		let wasAborted = false;
-		const exitCode = await new Promise<number>((resolve) => {
-			const invocation = getPiInvocation(args);
-			addJobLog(job, `spawn ${invocation.command} ${invocation.args.slice(0, -1).join(" ")} <task>`);
-			const child = spawn(invocation.command, invocation.args, {
-				cwd: taskCwd ?? cwd,
-				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
-				env: { ...process.env, PI_SUBAGENT: "1", PI_SUBAGENT_ID: job.id, PI_SUBAGENT_NAME: job.name },
-			});
-			job.status = "working";
-			job.updatedAt = Date.now();
-			addJobLog(job, `working in ${taskCwd ?? cwd}`);
-
-			let buffer = "";
-			const processLine = (line: string) => {
-				if (!line.trim()) return;
-				let event: any;
-				try {
-					event = JSON.parse(line);
-				} catch {
-					addJobLog(job, `stdout: ${truncateMiddle(line, 500)}`);
-					return;
-				}
-				logJsonEvent(job, event);
-				if (event.type === "message_end" && event.message) {
-					const message = event.message as Message;
-					result.messages.push(message);
-					if (message.role === "assistant") {
-						result.model = message.model ?? result.model;
-						result.stopReason = message.stopReason;
-						result.errorMessage = message.errorMessage;
-					}
-				}
-			};
-
-			child.stdout.on("data", (data) => {
-				buffer += data.toString();
-				const lines = buffer.split("\n");
-				buffer = lines.pop() ?? "";
-				for (const line of lines) processLine(line);
-			});
-			child.stderr.on("data", (data) => {
-				const text = data.toString();
-				result.stderr += text;
-				job.stderr += text;
-				addJobLog(job, `stderr: ${truncateMiddle(text.trim(), 500)}`);
-			});
-			child.on("error", (error) => {
-				result.errorMessage = error.message;
-				addJobLog(job, `process error: ${error.message}`);
-				resolve(1);
-			});
-			const timeout = setTimeout(() => {
-				addJobLog(job, `timed out after ${Math.round(JOB_TIMEOUT_MS / 60_000)} minutes`);
-				abort();
-			}, JOB_TIMEOUT_MS);
-			child.on("close", (code) => {
-				clearTimeout(timeout);
-				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
-			});
-
-			const abort = () => {
-				wasAborted = true;
-				job.status = "aborted";
-				job.updatedAt = Date.now();
-				child.kill("SIGTERM");
-				setTimeout(() => child.kill("SIGKILL"), 5_000).unref();
-			};
-			if (abortSignal.aborted) abort();
-			else abortSignal.addEventListener("abort", abort, { once: true });
+		const invocation = getPiInvocation(args);
+		addJobLog(job, `spawn ${invocation.command} ${invocation.args.join(" ")}`);
+		child = spawn(invocation.command, invocation.args, {
+			cwd: taskCwd ?? cwd,
+			shell: false,
+			stdio: ["pipe", "pipe", "pipe"],
+			env: { ...process.env, PI_SUBAGENT: "1", PI_SUBAGENT_ID: job.id, PI_SUBAGENT_NAME: job.name },
 		});
-
-		result.exitCode = exitCode;
+		client = new RpcProcessClient(child as ChildProcessWithoutNullStreams, {
+			onStderr: (text) => {
+				result.stderr = (result.stderr + text).slice(-LOG_CAP_CHARS);
+				job.stderr = (job.stderr + text).slice(-LOG_CAP_CHARS);
+				jobStore.appendStderr(job.id, text);
+			},
+		});
+		const refreshStats = () => {
+			if (!client || statsRefreshPending) return;
+			statsRefreshPending = true;
+			void client.getSessionStats().then((stats) => {
+				jobStore.appendTimeline(job.id, { type: "session-stats", totalTokens: stats.tokens.total, cost: stats.cost, at: Date.now() });
+				if (stats.contextUsage) jobStore.appendTimeline(job.id, { type: "context", ...stats.contextUsage, contextQuality: stats.contextUsage.tokens === null ? "unknown" : "estimated", at: Date.now() });
+			}).catch(() => {}).finally(() => { statsRefreshPending = false; });
+		};
+		unsubscribeRpc = client.onEvent((event) => {
+			recordRpcEvent(job, result, event);
+			if (event.type === "message_end" || event.type === "tool_execution_end" || event.type === "compaction_end") refreshStats();
+		});
+		const state = await client.getState();
+		if (state.model) {
+			job.model = `${state.model.provider}/${state.model.id}`;
+			result.model = job.model;
+			jobStore.update(job.id, { model: { ...modelMetadata, provider: state.model.provider, id: state.model.id, contextWindow: state.model.contextWindow, thinkingLevel: state.thinkingLevel } });
+		}
+		job.status = "working";
+		addJobLog(job, `working in ${taskCwd ?? cwd}`);
+		abortSignal = signal ? AbortSignal.any([signal, job.abortController.signal]) : job.abortController.signal;
+		let promptAccepted = false;
+		let abortRequested = false;
+		abortHandler = () => {
+			if (abortRequested) return;
+			abortRequested = true;
+			wasAborted = true;
+			addJobLog(job, "abort requested");
+			if (promptAccepted) void client?.abort().catch(() => {});
+			terminateTimer = setTimeout(() => {
+				if (child?.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+			}, 1_000);
+			killTimer = setTimeout(() => {
+				if (child?.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+			}, 6_000);
+			terminateTimer.unref();
+			killTimer.unref();
+		};
+		if (abortSignal.aborted) abortHandler();
+		else abortSignal.addEventListener("abort", abortHandler, { once: true });
+		if (abortRequested) throw new Error("Subagent was aborted before prompting.");
+		const settled = client.waitForSettled(JOB_TIMEOUT_MS);
+		void settled.catch(() => {});
+		await client.prompt(`Task: ${job.task}`);
+		promptAccepted = true;
+		if (abortRequested) await client.abort().catch(() => {});
+		await settled;
+		const stats = await client.getSessionStats().catch(() => undefined);
+		if (stats) {
+			jobStore.appendTimeline(job.id, { type: "session-stats", totalTokens: stats.tokens.total, cost: stats.cost, at: Date.now() });
+			if (stats.contextUsage) jobStore.appendTimeline(job.id, { type: "context", ...stats.contextUsage, contextQuality: stats.contextUsage.tokens === null ? "unknown" : "estimated", at: Date.now() });
+		}
+		result.exitCode = 0;
 		result.output = truncateBoundedOutput(getFinalAssistantOutput(result.messages) || result.errorMessage || result.stderr || "(no output)", { maxBytes: OUTPUT_CAP_BYTES, maxLines: OUTPUT_CAP_LINES }).text;
 		if (wasAborted) result.stopReason = "aborted";
-		result.status = wasAborted ? "aborted" : exitCode === 0 && result.stopReason !== "error" ? "done" : "failed";
-		job.status = result.status;
-		job.exitCode = exitCode;
-		job.output = result.output;
-		job.model = result.model;
-		job.stopReason = result.stopReason;
-		job.errorMessage = result.errorMessage;
-		job.finishedAt = Date.now();
-		job.updatedAt = job.finishedAt;
-		job.abort = undefined;
-		addJobLog(job, `${job.status} exit=${exitCode}`);
-		return result;
+		result.status = wasAborted ? "aborted" : result.stopReason === "error" ? "failed" : "done";
 	} catch (error) {
+		if (!wasAborted) void client?.abort().catch(() => {});
 		const errorMessage = error instanceof Error ? error.message : String(error);
-		const aborted = signal?.aborted || job.abortController.signal.aborted;
-		result.status = aborted ? "aborted" : "failed";
-		result.stopReason = aborted ? "aborted" : "error";
+		result.status = wasAborted || signal?.aborted || job.abortController.signal.aborted ? "aborted" : "failed";
+		result.stopReason = result.status === "aborted" ? "aborted" : "error";
 		result.errorMessage = errorMessage;
-		result.output = aborted ? "Cancelled before starting." : errorMessage;
-		job.status = result.status;
-		job.exitCode = 1;
-		job.stopReason = result.stopReason;
-		job.errorMessage = errorMessage;
-		job.output = result.output;
-		job.finishedAt = Date.now();
-		job.updatedAt = job.finishedAt;
-		job.abort = undefined;
-		addJobLog(job, `${job.status}: ${errorMessage}`);
-		return result;
+		result.output = result.status === "aborted" ? "Cancelled." : errorMessage;
 	} finally {
-		if (tempDir) await rm(tempDir, { recursive: true, force: true }).catch((error) => {
-			addJobLog(job, `temporary-file cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
-		});
+		if (abortSignal && abortHandler) abortSignal.removeEventListener("abort", abortHandler);
+		if (terminateTimer) clearTimeout(terminateTimer);
+		if (killTimer) clearTimeout(killTimer);
+		unsubscribeRpc?.();
+		client?.dispose();
+		if (child && child.exitCode === null && child.signalCode === null) {
+			child.kill("SIGTERM");
+			setTimeout(() => child?.kill("SIGKILL"), 5_000).unref();
+		}
+		if (tempDir) await rm(tempDir, { recursive: true, force: true }).catch(() => {});
 	}
+	job.status = result.status;
+	job.exitCode = result.exitCode;
+	job.output = result.output;
+	job.model = result.model;
+	job.stopReason = result.stopReason;
+	job.errorMessage = result.errorMessage;
+	job.finishedAt = Date.now();
+	job.updatedAt = job.finishedAt;
+	job.abort = undefined;
+	const fullOutput = getFinalAssistantOutput(result.messages) || result.errorMessage || result.stderr || result.output;
+	const stored = jobStore.setOutput(job.id, fullOutput);
+	jobStore.update(job.id, {
+		delivery: {
+			...stored.delivery,
+			originalOutputBytes: Buffer.byteLength(fullOutput, "utf8"),
+			deliveredOutputBytes: Buffer.byteLength(result.output, "utf8"),
+			outputTruncated: Buffer.byteLength(fullOutput, "utf8") > Buffer.byteLength(result.output, "utf8"),
+		},
+	});
+	addJobLog(job, `${job.status} exit=${job.exitCode}`);
+	pruneCompletedJobs();
+	return result;
 }
 
 function isFailure(result: RunResult): boolean {
@@ -468,6 +588,7 @@ function resultDetails(result: RunResult) {
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+	if (process.env.PI_SUBAGENT === "1") return;
 	const resultDelivery = new ResultDelivery<RunResult>();
 	let sessionContext: ExtensionContext | undefined;
 	const updateStatus = () => {
@@ -490,9 +611,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	};
 	pi.on("session_start", (_event, ctx) => { sessionContext = ctx; updateStatus(); });
 	pi.on("agent_end", () => { flushResults(); });
-	pi.on("session_shutdown", () => { sessionContext?.ui.setStatus("subagents", undefined); sessionContext = undefined; resultDelivery.clear(); });
+	pi.on("session_shutdown", () => {
+		for (const job of jobs.values()) {
+			if (job.abort) deliverySuppressed.add(job.id);
+			job.abort?.();
+		}
+		sessionContext?.ui.setStatus("subagents", undefined);
+		sessionContext = undefined;
+		resultDelivery.clear();
+	});
 
-	const startBackground = async (params: SubagentParams, ctx: ExtensionContext, signal: AbortSignal | undefined) => {
+	const startBackground = async (toolCallId: string, params: SubagentParams, ctx: ExtensionContext) => {
 		const scope = params.scope ?? "config";
 		const agents = discoverAgents(ctx.cwd, scope);
 		if (!params.agent || !params.task) throw new Error("agent and task are required.");
@@ -510,13 +639,24 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		if (!isTrustedChildCwd(ctx.cwd, cwdResult.cwd)) throw new Error("cwd must be the trusted project directory or one of its descendants.");
 		const agent = agents.find((candidate) => candidate.name === params.agent);
 		if (!agent) throw new Error(`Unknown agent. Available: ${agents.map((candidate) => candidate.name).join(", ") || "none"}`);
-		const job = createJob(params.agent, params.task, cwdResult.cwd, params.name);
 		const inheritedModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-		job.completion = runAgent(ctx.cwd, agent, job, cwdResult.cwd, params.model ?? inheritedModel, signal);
+		const model = resolveJobModel(params.model, undefined, agent.model, inheritedModel);
+		const job = createJob(params.agent, params.task, cwdResult.cwd, params.name, {
+			parentSessionId: ctx.sessionManager.getSessionId(),
+			toolCallId,
+			model,
+			delivery: { mode: "background", method: "deferred-follow-up", consumedByWait: false },
+		});
+		// Background jobs outlive the parent tool turn; explicit subagent_cancel owns their cancellation.
+		job.completion = runRpcAgent(ctx.cwd, agent, job, cwdResult.cwd, model, undefined);
 		job.completion.then((result) => {
+			pruneCompletedJobs();
 			updateStatus();
+			if (deliverySuppressed.has(result.id)) return;
 			resultDelivery.defer(result);
 			if (sessionContext?.isIdle()) flushResults();
+		}, (error) => {
+			addJobLog(job, `completion failed: ${error instanceof Error ? error.message : String(error)}`);
 		});
 		return job;
 	};
@@ -544,13 +684,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				await ctx.ui.editor("Subagent jobs", formatStatusBlock());
 				return;
 			}
-			while (true) {
-				const id = await selectSubagentJob(ctx);
-				if (!id) return;
-				const job = jobs.get(id);
-				if (!job) continue;
-				await ctx.ui.editor(`Subagent log: ${job.id}`, formatJobLog(job));
-			}
+			await openSubagentInspector(ctx, jobStore);
 		},
 	});
 
@@ -564,10 +698,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			"Give subagent_spawn a self-contained task with relevant paths and the expected report.",
 		],
 		parameters: Type.Intersect([SubagentParamsSchema, Type.Object({ agent: Type.String(), task: Type.String() })]),
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
 			const active = [...jobs.values()].filter((job) => job.status === "initializing" || job.status === "working").length;
 			if (active >= MAX_PARALLEL_TASKS) throw new Error(`Too many running subagents. Max is ${MAX_PARALLEL_TASKS}.`);
-			const job = await startBackground(params, ctx, signal);
+			const job = await startBackground(toolCallId, params, ctx);
 			updateStatus();
 			return { content: [{ type: "text", text: `Spawned ${job.id} (${job.name}). Continue working; use subagent_wait when its result is needed.` }], details: { id: job.id, status: job.status } };
 		},
@@ -601,15 +735,30 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		description: "Wait for specified background subagents and return their final reports.",
 		parameters: Type.Object({ ids: Type.Array(Type.String(), { minItems: 1, description: "Subagent job ids" }) }),
 		async execute(_toolCallId, params, signal, onUpdate) {
-			resultDelivery.consume(params.ids);
 			const selected = params.ids.map((id) => {
 				const job = jobs.get(id);
 				if (!job?.completion) throw new Error(`Unknown subagent job: ${id}`);
 				return job;
 			});
 			if (signal?.aborted) throw new Error("Wait aborted. Subagents keep running.");
+			resultDelivery.consume(params.ids);
+			for (const job of selected) {
+				const snapshot = jobStore.get(job.id);
+				if (snapshot) jobStore.update(job.id, { delivery: { ...snapshot.delivery, method: "subagent-wait", consumedByWait: true } });
+			}
 			onUpdate?.({ content: [{ type: "text", text: `Waiting for ${params.ids.join(", ")}...` }], details: { ids: params.ids } });
-			const results = await Promise.all(selected.map((job) => job.completion!));
+			const completion = Promise.all(selected.map((job) => job.completion!));
+			let abortWait: (() => void) | undefined;
+			const aborted = signal ? new Promise<never>((_resolve, reject) => {
+				abortWait = () => reject(new Error("Wait aborted. Subagents keep running."));
+				signal.addEventListener("abort", abortWait, { once: true });
+			}) : undefined;
+			let results: RunResult[];
+			try {
+				results = aborted ? await Promise.race([completion, aborted]) : await completion;
+			} finally {
+				if (signal && abortWait) signal.removeEventListener("abort", abortWait);
+			}
 			return {
 				content: [{ type: "text", text: results.map((result) => `## ${result.id} ${result.name} — ${result.status}\n\n${result.output}`).join("\n\n---\n\n") }],
 				details: { results: results.map(resultDetails) },
@@ -648,7 +797,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			"Use subagent only with a specific, self-contained task and include relevant paths or constraints.",
 		],
 		parameters: SubagentParamsSchema,
-		async execute(_toolCallId, params: SubagentParams, signal, onUpdate, ctx) {
+		async execute(toolCallId, params: SubagentParams, signal, onUpdate, ctx) {
 			const scope = params.scope ?? "config";
 			const agents = discoverAgents(ctx.cwd, scope);
 			const hasSingle = Boolean(params.agent && params.task);
@@ -682,13 +831,33 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 			const run = async (item: { agent: string; task: string; cwd?: string; name?: string; model?: string }) => {
 				const cwdResult = validateCwd(ctx.cwd, item.cwd);
-				const job = createJob(item.agent, item.task, cwdResult.cwd, item.name);
+				const inheritedModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+				const profile = agents.find((candidate) => candidate.name === item.agent);
+				const model = resolveJobModel(item.model, params.model, profile?.model, inheritedModel);
+				const job = createJob(item.agent, item.task, cwdResult.cwd, item.name, {
+					parentSessionId: ctx.sessionManager.getSessionId(),
+					toolCallId,
+					model,
+					delivery: { mode: params.tasks?.length ? "batch" : "foreground", method: "tool-result", consumedByWait: false },
+				});
+				const active = [...jobs.values()].filter((candidate) => candidate.status === "initializing" || candidate.status === "working").length;
+				if (active > MAX_PARALLEL_TASKS) {
+					const output = `Too many running subagents. Max is ${MAX_PARALLEL_TASKS}.`;
+					job.status = "failed";
+					job.output = output;
+					job.exitCode = 1;
+					job.finishedAt = Date.now();
+					jobStore.setOutput(job.id, output);
+					addJobLog(job, output);
+					return { id: job.id, name: job.name, agent: item.agent, task: item.task, status: "failed", exitCode: 1, output, stderr: "", messages: [] } satisfies RunResult;
+				}
 				if (cwdResult.error || !isTrustedChildCwd(ctx.cwd, cwdResult.cwd)) {
 					const error = cwdResult.error ?? "cwd must be the trusted project directory or one of its descendants.";
 					job.status = "failed";
 					job.output = error;
 					job.exitCode = 1;
 					job.finishedAt = Date.now();
+					jobStore.setOutput(job.id, error);
 					addJobLog(job, error);
 					return {
 						id: job.id,
@@ -702,13 +871,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 						messages: [],
 					} satisfies RunResult;
 				}
-				const agent = agents.find((candidate) => candidate.name === item.agent);
+				const agent = profile;
 				if (!agent) {
 					const output = `Unknown agent. Available: ${agents.map((a) => a.name).join(", ") || "none"}`;
 					job.status = "failed";
 					job.output = output;
 					job.exitCode = 1;
 					job.finishedAt = Date.now();
+					jobStore.setOutput(job.id, output);
 					addJobLog(job, output);
 					return {
 						id: job.id,
@@ -722,8 +892,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 						messages: [],
 					} satisfies RunResult;
 				}
-				const inheritedModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-				return runAgent(ctx.cwd, agent, job, cwdResult.cwd, item.model ?? params.model ?? inheritedModel, signal);
+				return runRpcAgent(ctx.cwd, agent, job, cwdResult.cwd, model, signal);
 			};
 
 			if (hasSingle) {
