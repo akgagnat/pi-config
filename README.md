@@ -36,7 +36,7 @@ tsconfig.json          # minimal TypeScript authoring config
 ## Quick start
 
 1. Clone this repo, preferably to `~/Projects/pi-config`.
-2. Add the extension paths you want from this repo to `~/.pi/agent/settings.json`.
+2. Add this repo's `extensions/` directory to `~/.pi/agent/settings.json`.
 3. Restart Pi or run `/reload`.
 4. See:
    - `docs/setup.md`
@@ -45,6 +45,6 @@ tsconfig.json          # minimal TypeScript authoring config
 
 ## Notes
 
-- Extension activation is explicit: list only the extension files you want active.
+- Extension activation is explicit: add the `extensions/` directory to Pi settings.
 - `extensions/` should contain only real extensions, not starter samples.
 - Third-party tools are documented in `inventory/third-party.md`; they are not managed by this repo.

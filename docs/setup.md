@@ -22,9 +22,7 @@ cd ~/Projects/pi-config
 
 ## 2. Decide which extensions should be active
 
-This repo does not auto-load everything in `extensions/`.
-
-Instead, add only the specific extension file paths you want active.
+Add the repo's `extensions/` directory to Pi settings to load its extensions.
 
 See:
 
@@ -39,7 +37,7 @@ Edit:
 ~/.pi/agent/settings.json
 ```
 
-Add or update the `extensions` array with the extension paths you want from this repo.
+Add or update the `extensions` array with the path to this repo's `extensions/` directory.
 
 ## 4. Reload Pi
 
@@ -62,4 +60,4 @@ Typical checks:
 
 - Replace all example paths with your real local clone path.
 - Keep secrets out of this repo and out of example config files.
-- Keep extension file loading explicit; do not point Pi at the whole `extensions/` directory.
+- Point Pi at this repo's whole `extensions/` directory.

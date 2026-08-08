@@ -40,7 +40,7 @@ Conventions:
 - write extensions in TypeScript
 - allow simple one-file extensions
 - use a directory per extension once it grows beyond a single file
-- activate extensions explicitly by path in Pi settings
+- activate the whole `extensions/` directory by path in Pi settings
 
 ### `config/`
 

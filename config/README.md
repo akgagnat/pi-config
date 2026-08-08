@@ -38,4 +38,4 @@ Concrete examples:
 }
 ```
 
-Use explicit file paths for extensions.
+Point Pi at the whole `extensions/` directory.
