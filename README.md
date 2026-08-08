@@ -1,13 +1,12 @@
 # pi-config
 
-Personal repo for my custom Pi extensions and shared skills, plus the minimal docs and config examples needed to load them on a new machine.
+Personal repo for my custom Pi extensions, plus the minimal docs and config examples needed to load them on a new machine.
 
 ## Scope
 
 This repo currently tracks:
 
 - custom Pi extensions I actually use
-- repo-local Pi skills that support those workflows
 - profile-based subagents with background spawn, inspection, waiting, and cancellation
 - setup notes for wiring this repo into Pi
 - a minimal example `settings.json` snippet
@@ -25,7 +24,6 @@ Out of scope for v1:
 
 ```text
 extensions/            # real custom Pi extensions
-skills/                # repo-local Pi skills loaded explicitly via settings
 config/                # minimal global Pi settings example + notes
 inventory/             # third-party Pi extension/package inventory
 docs/
@@ -38,7 +36,7 @@ tsconfig.json          # minimal TypeScript authoring config
 ## Quick start
 
 1. Clone this repo, preferably to `~/Projects/pi-config`.
-2. Add the extension paths and skills path you want from this repo to `~/.pi/agent/settings.json`.
+2. Add the extension paths you want from this repo to `~/.pi/agent/settings.json`.
 3. Restart Pi or run `/reload`.
 4. See:
    - `docs/setup.md`
@@ -48,6 +46,5 @@ tsconfig.json          # minimal TypeScript authoring config
 ## Notes
 
 - Extension activation is explicit: list only the extension files you want active.
-- Skill loading is also explicit: add this repo's `skills/` path if you want its shared skills available globally.
 - `extensions/` should contain only real extensions, not starter samples.
 - Third-party tools are documented in `inventory/third-party.md`; they are not managed by this repo.

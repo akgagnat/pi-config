@@ -20,11 +20,11 @@ git clone <repo-url> ~/Projects/pi-config
 cd ~/Projects/pi-config
 ```
 
-## 2. Decide which extensions and skills should be active
+## 2. Decide which extensions should be active
 
-This repo does not auto-load everything in `extensions/` or `skills/`.
+This repo does not auto-load everything in `extensions/`.
 
-Instead, add only the specific extension file paths you want active, plus the repo `skills/` path if you want those shared skills available in Pi.
+Instead, add only the specific extension file paths you want active.
 
 See:
 
@@ -39,7 +39,7 @@ Edit:
 ~/.pi/agent/settings.json
 ```
 
-Add or update the `extensions` array with the extension paths you want from this repo, and add the repo `skills/` path to the `skills` array if you want those skills loaded globally.
+Add or update the `extensions` array with the extension paths you want from this repo.
 
 ## 4. Reload Pi
 
@@ -50,11 +50,11 @@ Either:
 
 ## 5. Verify
 
-After adding a real extension or skill, confirm it loads in Pi.
+After adding a real extension, confirm it loads in Pi.
 
 Typical checks:
 
-- Pi startup header shows the extension or skill as loaded
+- Pi startup header shows the extension as loaded
 - the extension's command/tool/behavior appears as expected
 - `/reload` succeeds without errors
 
@@ -63,4 +63,3 @@ Typical checks:
 - Replace all example paths with your real local clone path.
 - Keep secrets out of this repo and out of example config files.
 - Keep extension file loading explicit; do not point Pi at the whole `extensions/` directory.
-- Add the repo `skills/` path explicitly if you want its shared skills available across projects.
