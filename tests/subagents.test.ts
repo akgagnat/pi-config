@@ -84,7 +84,7 @@ test("an unavailable profile does not leave an initializing background job", asy
 	assert.doesNotThrow(() => structuredClone(listing.details));
 });
 
-test("subagents-status opens the read-only live inspector", async () => {
+test("subagents opens the read-only live inspector", async () => {
 	const tools = new Map<string, any>();
 	const commands = new Map<string, any>();
 	subagentsExtension({
@@ -110,7 +110,7 @@ test("subagents-status opens the read-only live inspector", async () => {
 	);
 	const id = result.details.result.id;
 	let customCalls = 0;
-	await commands.get("subagents-status").handler("", {
+	await commands.get("subagents").handler("", {
 		...baseCtx,
 		mode: "tui",
 		ui: {
@@ -119,6 +119,8 @@ test("subagents-status opens the read-only live inspector", async () => {
 			custom: async () => { customCalls++; },
 		},
 	});
+	assert.equal(commands.has("subagent-profiles"), true);
+	assert.equal(commands.has("subagents-status"), false);
 	assert.equal(commands.has("subagent-log"), false);
 	assert.equal(customCalls, 1);
 	assert.match(id, /^sa-/);

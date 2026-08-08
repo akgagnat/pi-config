@@ -596,12 +596,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		return job;
 	};
 
-	pi.registerCommand("subagents", {
+	pi.registerCommand("subagent-profiles", {
 		description: "List available subagent profiles",
 		handler: async (args, ctx) => {
 			const scope = (args.trim() || "config") as NonNullable<SubagentParams["scope"]>;
 			if (!["config", "user", "project", "all"].includes(scope)) {
-				ctx.ui.notify("Usage: /subagents [config|user|project|all]", "warning");
+				ctx.ui.notify("Usage: /subagent-profiles [config|user|project|all]", "warning");
 				return;
 			}
 			const agents = discoverAgents(ctx.cwd, scope);
@@ -612,7 +612,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerCommand("subagents-status", {
+	pi.registerCommand("subagents", {
 		description: "Browse recent subagent jobs and their logs",
 		handler: async (_args, ctx) => {
 			if (ctx.mode !== "tui") {
