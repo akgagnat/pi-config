@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { formatInspectorActivity, getInspectorDetailLines, moveInspectorSelection } from "../extensions/subagents/inspector.ts";
+import { formatInspectorActivity, formatThinkingVisibility, getInspectorDetailLines, moveInspectorSelection } from "../extensions/subagents/inspector.ts";
 import { JobStore } from "../extensions/subagents/job-store.ts";
 
 function inspectedJob() {
@@ -57,9 +57,13 @@ test("inspector hides thinking unless explicitly enabled", () => {
 	const hidden = getInspectorDetailLines(job, "Conversation", false).join("\n");
 	const shown = getInspectorDetailLines(job, "Conversation", true).join("\n");
 	assert.doesNotMatch(hidden, /secret reasoning/);
-	assert.match(shown, /secret reasoning/);
+	assert.match(shown, /╭─ Thinking/);
+	assert.match(shown, /│ secret reasoning/);
+	assert.match(shown, /╰─ end thinking/);
 	assert.match(hidden, /read/);
 	assert.match(hidden, /Review complete/);
+	assert.equal(formatThinkingVisibility(false), "thinking: OFF");
+	assert.equal(formatThinkingVisibility(true), "thinking: ON");
 });
 
 test("inspector distinguishes communication and context metadata", () => {

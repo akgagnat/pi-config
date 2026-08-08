@@ -31,6 +31,16 @@ function summarizeValue(value: unknown, limit = 100): string {
 	return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
 }
 
+function appendThinkingBlock(lines: string[], title: string, thinking: string): void {
+	lines.push(`╭─ ${title}`);
+	for (const line of thinking.split("\n")) lines.push(`│ ${safeText(line)}`);
+	lines.push("╰─ end thinking", "");
+}
+
+export function formatThinkingVisibility(showThinking: boolean): string {
+	return `thinking: ${showThinking ? "ON" : "OFF"}`;
+}
+
 export function formatInspectorActivity(event: DeepReadonly<TelemetryEvent>): string | undefined {
 	const prefix = eventTime(event);
 	switch (event.type) {
@@ -74,7 +84,7 @@ export function getInspectorDetailLines(job: JobSnapshot, view: InspectorView, s
 			if (event.type === "text-delta") text += event.delta;
 			if (event.type === "thinking-delta") thinking += event.delta;
 			if (event.type === "assistant-message") {
-				if (showThinking && event.thinking) lines.push("Thinking:", event.thinking, "");
+				if (showThinking && event.thinking) appendThinkingBlock(lines, "Thinking", event.thinking);
 				if (event.text) lines.push("Assistant:", event.text, "");
 				text = "";
 				thinking = "";
@@ -82,7 +92,7 @@ export function getInspectorDetailLines(job: JobSnapshot, view: InspectorView, s
 			if (event.type === "tool-start") lines.push(`→ ${event.name} ${summarizeValue(event.args, 180)}`);
 			if (event.type === "tool-end") lines.push(`← ${event.name} ${event.isError ? "failed" : "completed"}`);
 		}
-		if (showThinking && thinking) lines.push("Thinking (streaming):", thinking, "");
+		if (showThinking && thinking) appendThinkingBlock(lines, "Thinking (streaming)", thinking);
 		if (text) lines.push("Assistant (streaming):", text);
 		else if (lines.length === 0) lines.push("(waiting for assistant output)");
 		return lines;
@@ -171,7 +181,8 @@ export async function openSubagentInspector(ctx: ExtensionContext, store: JobSto
 				lastWide = wide;
 				const tabs = VIEWS.map((name, index) => index === viewIndex ? theme.fg("accent", `[${name}]`) : theme.fg("muted", name)).join("  ");
 				const header = theme.fg("accent", theme.bold("Subagent inspector"));
-				const help = theme.fg("dim", "↑↓ select · j/k scroll · enter inspect · tab view · f follow · t thinking · esc close");
+				const thinkingVisibility = theme.fg(showThinking ? "warning" : "dim", formatThinkingVisibility(showThinking));
+				const help = `${theme.fg("dim", "↑↓ select · j/k scroll · enter inspect · tab view · f follow · t toggle")} · ${thinkingVisibility} · ${theme.fg("dim", "esc close")}`;
 				if (!job) return [header, "", theme.fg("muted", "No subagent jobs yet."), "", help].map((line) => truncateToWidth(line, width));
 				const context = latest(job, "context");
 				const summary = `${job.id} ${job.status} · ${safeText(job.agent)} · ${safeText(job.model.provider && job.model.id ? `${job.model.provider}/${job.model.id}` : job.model.requested ?? "default")} · ctx ${context?.tokens === null || !context ? "?" : formatCount(context.tokens)}/${context ? formatCount(context.contextWindow) : "?"}`;
