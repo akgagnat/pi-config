@@ -131,10 +131,19 @@ function padToWidth(value: string, width: number): string {
 	return truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
 }
 
+function sortedInspectorJobs(store: JobStore): DeepReadonly<JobSnapshot>[] {
+	return store.list().sort((a, b) => b.startedAt - a.startedAt);
+}
+
+export function moveInspectorSelection(jobs: readonly DeepReadonly<JobSnapshot>[], selectedId: string | undefined, delta: -1 | 1): string | undefined {
+	if (jobs.length === 0) return undefined;
+	const current = Math.max(0, jobs.findIndex((job) => job.id === selectedId));
+	return jobs[Math.max(0, Math.min(jobs.length - 1, current + delta))].id;
+}
+
 export async function openSubagentInspector(ctx: ExtensionContext, store: JobStore): Promise<void> {
 	if (ctx.mode !== "tui") return;
 	await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
-		let selected = 0;
 		let selectedId: string | undefined;
 		let lastWide = false;
 		let viewIndex = 0;
@@ -153,12 +162,8 @@ export async function openSubagentInspector(ctx: ExtensionContext, store: JobSto
 		const unsubscribe = store.subscribe(requestRender);
 		const component = {
 			render(width: number): string[] {
-				const jobs = store.list().sort((a, b) => b.startedAt - a.startedAt);
-				if (selectedId) {
-					const selectedIndex = jobs.findIndex((candidate) => candidate.id === selectedId);
-					if (selectedIndex >= 0) selected = selectedIndex;
-				}
-				selected = Math.max(0, Math.min(selected, jobs.length - 1));
+				const jobs = sortedInspectorJobs(store);
+				let selected = Math.max(0, jobs.findIndex((candidate) => candidate.id === selectedId));
 				const job = jobs[selected];
 				selectedId = job?.id;
 				const height = Math.max(8, tui.terminal.rows - 4);
@@ -196,7 +201,7 @@ export async function openSubagentInspector(ctx: ExtensionContext, store: JobSto
 				return [header, theme.fg("muted", summary), tabs, "", ...rows, "", help].map((line) => truncateToWidth(line, width));
 			},
 			handleInput(data: string): void {
-				const jobs = store.list();
+				const jobs = sortedInspectorJobs(store);
 				if (matchesKey(data, Key.escape)) {
 					if (narrowDetail) { narrowDetail = false; scroll = 0; }
 					else done();
@@ -216,12 +221,10 @@ export async function openSubagentInspector(ctx: ExtensionContext, store: JobSto
 					follow = false;
 					scroll++;
 				} else if (matchesKey(data, Key.up)) {
-					selected = Math.max(0, selected - 1);
-					selectedId = jobs[selected]?.id;
+					selectedId = moveInspectorSelection(jobs, selectedId, -1);
 					scroll = 0;
 				} else if (matchesKey(data, Key.down)) {
-					selected = Math.min(Math.max(0, jobs.length - 1), selected + 1);
-					selectedId = jobs[selected]?.id;
+					selectedId = moveInspectorSelection(jobs, selectedId, 1);
 					scroll = 0;
 				}
 				tui.requestRender();

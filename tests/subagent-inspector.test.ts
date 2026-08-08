@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { formatInspectorActivity, getInspectorDetailLines } from "../extensions/subagents/inspector.ts";
+import { formatInspectorActivity, getInspectorDetailLines, moveInspectorSelection } from "../extensions/subagents/inspector.ts";
 import { JobStore } from "../extensions/subagents/job-store.ts";
 
 function inspectedJob() {
@@ -24,6 +24,33 @@ function inspectedJob() {
 	store.appendTimeline("sa-1", { type: "session-stats", totalTokens: 50_000, cost: 0.125, at: 7 });
 	return store.get("sa-1")!;
 }
+
+test("arrow navigation follows the same newest-first order shown by the inspector", () => {
+	let now = 0;
+	const store = new JobStore({ now: () => ++now });
+	for (const id of ["oldest", "middle", "newest"]) {
+		store.create({
+			id,
+			name: id,
+			agent: "worker",
+			task: id,
+			cwd: "/work/project",
+			parent: {},
+			model: { source: "default" },
+			delivery: { mode: "background", method: "deferred-follow-up", consumedByWait: false },
+		});
+	}
+	const jobs = store.list().sort((a, b) => b.startedAt - a.startedAt);
+	let selected: string | undefined = jobs[0].id;
+	selected = moveInspectorSelection(jobs, selected, 1);
+	assert.equal(selected, "middle");
+	selected = moveInspectorSelection(jobs, selected, 1);
+	assert.equal(selected, "oldest");
+	selected = moveInspectorSelection(jobs, selected, -1);
+	assert.equal(selected, "middle");
+	selected = moveInspectorSelection(jobs, selected, -1);
+	assert.equal(selected, "newest");
+});
 
 test("inspector hides thinking unless explicitly enabled", () => {
 	const job = inspectedJob();
