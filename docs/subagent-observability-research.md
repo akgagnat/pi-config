@@ -2,17 +2,17 @@
 
 ## Status
 
-Research document for future implementation reference.
+Historical research and implementation-design reference. The core recommendation below is implemented: subagents run as isolated RPC subprocesses, feed an observable bounded job store, and have a full-screen read-only live inspector. The current implementation lives in `extensions/subagents/`; see issue #11 for the later comparison and settled follow-up decisions.
 
 ## Summary
 
-The subagents extension already receives most of the telemetry needed for a useful live inspector, but currently discards much of it. The recommended design is:
+The recommended design was:
 
 > Run subagents as isolated RPC subprocesses, maintain their state in an observable bounded job store, and expose a full-screen read-only TUI inspector.
 
 This preserves subprocess isolation while adding access to Pi's resolved child model, session statistics, messages, streaming events, and context-usage estimate.
 
-## Current implementation
+## Research-time baseline (historical)
 
 ### Current flow
 
