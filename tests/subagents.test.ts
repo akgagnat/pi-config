@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import test from "node:test";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { formatActivityStatus } from "../extensions/subagents/status.ts";
 import { isTrustedChildCwd } from "../extensions/subagents/policy.ts";
@@ -20,9 +20,9 @@ test("activity status distinguishes active and failed subagents", () => {
 });
 
 test("child cwd policy keeps profile agents inside the trusted parent project", () => {
-	assert.equal(isTrustedChildCwd("/work/project", "/work/project"), true);
-	assert.equal(isTrustedChildCwd("/work/project", "/work/project/packages/app"), true);
-	assert.equal(isTrustedChildCwd("/work/project", "/work/other"), false);
+	assert.equal(isTrustedChildCwd("/work/project", "/work/project", resolve), true);
+	assert.equal(isTrustedChildCwd("/work/project", "/work/project/packages/app", resolve), true);
+	assert.equal(isTrustedChildCwd("/work/project", "/work/other", resolve), false);
 });
 
 test("mutation-capable profiles are exclusive per normalized working directory", () => {
@@ -109,6 +109,8 @@ test("rejected subagent requests do not create jobs", async () => {
 		/Unknown agent/,
 	);
 	assert.equal(tools.has("subagent_steer"), true);
+	assert.equal(tools.has("subagent_requests"), true);
+	assert.equal(tools.has("subagent_reply"), true);
 	await assert.rejects(
 		tools.get("subagent_steer").execute("call", { id: "missing", instruction: "Continue" }),
 		/Unknown subagent job/,

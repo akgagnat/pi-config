@@ -88,6 +88,21 @@ test("RPC client emits fragmented LF-delimited events", async () => {
 	client.dispose();
 });
 
+test("RPC client lets a reserved handler own child extension UI requests", async () => {
+	const child = fakeChild();
+	const claimed: any[] = [];
+	const client = new RpcProcessClient(child, { onExtensionUiRequest: (request) => { claimed.push(request); return true; } });
+	let writes = 0;
+	child.stdin.on("data", () => writes++);
+	child.stdout.write('{"type":"extension_ui_request","id":"ui-1","method":"input","placeholder":"reserved"}\n');
+	assert.equal(writes, 0);
+	assert.equal(claimed[0].placeholder, "reserved");
+	const written = nextWrittenJson(child.stdin);
+	client.respondExtensionUi("ui-1", { value: "reply" });
+	assert.equal((await written).value, "reply");
+	client.dispose();
+});
+
 test("RPC client automatically cancels child extension dialogs", async () => {
 	const child = fakeChild();
 	const client = new RpcProcessClient(child);

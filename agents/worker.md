@@ -1,7 +1,8 @@
 ---
 name: worker
 description: Generic read-only subagent for independent investigation, review, planning, and analysis
-tools: read,grep,find,ls
+tools: read,grep,find,ls,contact_supervisor
+extensions: extensions/subagents/contact-supervisor.ts
 ---
 You are a generic Pi subagent running in an isolated context window.
 

@@ -20,4 +20,5 @@ export type TelemetryEvent =
 	| { type: "retry"; attempt: number; maxAttempts: number; delayMs: number; at: number }
 	| { type: "compaction"; phase: "start" | "end"; reason: string; at: number }
 	| { type: "steering"; steeringId: string; instruction: string; outcome: "requested" | "accepted" | "failed" | "unavailable"; message?: string; at: number }
+	| { type: "escalation"; requestId: string; kind: "decision" | "input" | "progress"; subject: string; message: string; status: "pending" | "progress" | "replied" | "timed-out" | "cancelled" | "failed"; reply?: string; error?: string; at: number }
 	| { type: "agent-end"; stopReason?: StopReason; errorMessage?: string; at: number };

@@ -55,6 +55,7 @@ export function formatInspectorActivity(event: DeepReadonly<TelemetryEvent>): st
 		case "context": return `${prefix}  context ${event.tokens === null ? "unknown" : formatCount(event.tokens)}/${formatCount(event.contextWindow)}${event.percent === null ? "" : ` (${event.percent.toFixed(1)}%)`}`;
 		case "session-stats": return `${prefix}  usage ${formatCount(event.totalTokens)} tokens · $${event.cost.toFixed(4)}`;
 		case "steering": return `${prefix}  steer ${event.steeringId} ${event.outcome}`;
+		case "escalation": return `${prefix}  supervisor ${event.requestId} ${event.kind} ${event.status}`;
 		case "agent-end": return `${prefix}  agent ended${event.stopReason ? ` (${event.stopReason})` : ""}`;
 		default: return undefined;
 	}
@@ -99,6 +100,14 @@ export function getInspectorDetailLines(job: JobSnapshot, view: InspectorView, s
 		return lines;
 	}
 	if (view === "Communication") {
+		const escalationLines = job.timeline
+			.filter((event) => event.type === "escalation")
+			.flatMap((event) => [
+				`  ${eventTime(event)} ${event.requestId} ${event.kind} ${event.status}: ${safeText(event.subject)}`,
+				`    ${safeText(event.message)}`,
+				...(event.reply ? [`    reply: ${safeText(event.reply)}`] : []),
+				...(event.error ? [`    error: ${safeText(event.error)}`] : []),
+			]);
 		const steeringLines = job.timeline
 			.filter((event) => event.type === "steering")
 			.flatMap((event) => [
@@ -117,6 +126,9 @@ export function getInspectorDetailLines(job: JobSnapshot, view: InspectorView, s
 			"Steering ledger",
 			...(job.droppedSteeringEvents ? [`  … ${job.droppedSteeringEvents} earlier steering events omitted`] : []),
 			...(steeringLines.length ? steeringLines : ["  (none)"]),
+			"",
+			"Escalation ledger",
+			...(escalationLines.length ? escalationLines : ["  (none)"]),
 			"",
 			"Child → parent",
 			`  method: ${job.delivery.method}`,

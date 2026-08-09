@@ -12,8 +12,10 @@ export type AgentProfile = {
 	systemPrompt: string;
 	source: AgentSource;
 	filePath: string;
+	trustRoot: string;
 	model?: string;
 	tools?: string[];
+	extensions?: string[];
 };
 
 export function parseFrontmatter(markdown: string): { frontmatter: Record<string, string>; body: string } {
@@ -43,8 +45,10 @@ function loadProfiles(dir: string, source: AgentSource): AgentProfile[] {
 				systemPrompt: body.trim(),
 				source,
 				filePath,
+				trustRoot: dirname(dir),
 				model: frontmatter.model,
 				tools: frontmatter.tools?.split(",").map((tool) => tool.trim()).filter(Boolean),
+				extensions: frontmatter.extensions?.split(",").map((extension) => extension.trim()).filter(Boolean),
 			}];
 		});
 }

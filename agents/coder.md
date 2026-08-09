@@ -1,7 +1,8 @@
 ---
 name: coder
 description: Generic coding subagent that can inspect, edit, and create code or documentation
-tools: read,grep,find,ls,edit,write,bash
+tools: read,grep,find,ls,edit,write,bash,contact_supervisor
+extensions: extensions/subagents/contact-supervisor.ts
 ---
 You are a generic Pi coding subagent running in an isolated context window.
 

@@ -173,6 +173,13 @@ function boundTelemetryEvent(event: TelemetryEvent): TelemetryEvent {
 		instruction: bytePrefix(clone.instruction, 20_000),
 		...(clone.message ? { message: bytePrefix(clone.message, 2_000) } : {}),
 	};
+	if (clone.type === "escalation") return {
+		...clone,
+		subject: bytePrefix(clone.subject, 1_000),
+		message: bytePrefix(clone.message, 20_000),
+		...(clone.reply ? { reply: bytePrefix(clone.reply, 20_000) } : {}),
+		...(clone.error ? { error: bytePrefix(clone.error, 2_000) } : {}),
+	};
 	return clone;
 }
 

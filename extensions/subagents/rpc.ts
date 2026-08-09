@@ -20,7 +20,7 @@ export type RpcSessionStats = {
 };
 
 export type RpcProcessEvent = JsonAgentSessionEvent
-	| { type: "extension_ui_request"; id: string; method: string }
+	| { type: "extension_ui_request"; id: string; method: string; placeholder?: string; message?: string; title?: string }
 	| { type: "transport_error"; message: string };
 
 type RpcCommandBody = RpcCommand extends infer T ? T extends { id?: string } ? Omit<T, "id"> : never : never;
@@ -48,6 +48,7 @@ export class RpcProcessClient {
 		private readonly options: {
 			maxFrameBytes?: number;
 			onStderr?: (text: string) => void;
+			onExtensionUiRequest?: (request: Extract<RpcProcessEvent, { type: "extension_ui_request" }>) => boolean;
 		} = {},
 	) {
 		child.stdout.on("data", this.handleData);
@@ -88,6 +89,11 @@ export class RpcProcessClient {
 
 	async abort(): Promise<void> {
 		await this.request({ type: "abort" });
+	}
+
+	respondExtensionUi(id: string, response: { value: string } | { cancelled: true }): void {
+		if (this.closedError || !this.child.stdin.writable || this.child.stdin.destroyed) return;
+		this.child.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id, ...response })}\n`);
 	}
 
 	waitForSettled(timeoutMs: number): Promise<void> {
@@ -213,12 +219,13 @@ export class RpcProcessClient {
 			pending.resolve(value as RpcResponse);
 			return;
 		}
-		if (
-			value.type === "extension_ui_request"
-			&& typeof value.id === "string"
-			&& ["select", "confirm", "input", "editor"].includes(value.method)
-		) {
-			this.child.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: value.id, cancelled: true })}\n`);
+		if (value.type === "extension_ui_request" && typeof value.id === "string") {
+			const request = value as Extract<RpcProcessEvent, { type: "extension_ui_request" }>;
+			if (this.options.onExtensionUiRequest?.(request)) {
+				this.emit(request);
+				return;
+			}
+			if (["select", "confirm", "input", "editor"].includes(value.method)) this.respondExtensionUi(value.id, { cancelled: true });
 		}
 		if (value && typeof value.type === "string") this.emit(value as RpcProcessEvent);
 	}

@@ -66,3 +66,18 @@ Unsupported fields or invalid values cause subagent launch to fail with a clear 
 `subagent_steer` sends an instruction to an existing **working** RPC child through Pi's `steer` command. A successful result means the child RPC process accepted the instruction into its steering queue; it does not prove that the model read or complied with it. Steering never restarts, replaces, resumes, or revives a child.
 
 Unknown, initializing, completed, failed, aborted, and cancellation-in-progress jobs are rejected. If cancellation begins after a steer has already been written, that delivery may still be reported as accepted, but cancellation continues and the child is still terminated. RPC rejection and process-exit races are reported as failed delivery. Requested and final delivery outcomes are retained in a bounded steering ledger and shown in the inspector's Communication view; instructions are also part of the bounded journal telemetry.
+
+## Explicit child extensions and escalation
+
+Children still use `--no-extensions`, so global and project extensions are never discovered or inherited. A profile may opt into trusted child-only extension files with comma-separated scalar frontmatter:
+
+```yaml
+tools: read,grep,contact_supervisor
+extensions: extensions/subagents/contact-supervisor.ts
+```
+
+Each path must be relative to the profile's trust root (the config repository root, the user agent directory, or the trusted project's `.pi` directory). Absolute paths, traversal, missing/non-files, unsupported file types, and symlink escapes are rejected before a job is created. Pi receives each canonical file through an explicit `--extension` argument. `tools` remains the active-tool allowlist, so an extension tool must also be named there. Tool allowlisting does **not** sandbox an extension: an explicitly allowed extension is trusted executable code with the user's process permissions, environment, and event hooks.
+
+The bundled child-only `contact_supervisor` tool supports blocking `decision` and structured `input` requests plus non-blocking `progress` updates. It is for material ambiguity or missing information, not routine completion handoff. The parent inspects requests with `subagent_requests` and replies explicitly with `subagent_reply`; it may instead use `subagent_steer` for unsolicited instruction changes. Requests use UUID correlation, are scoped to the live parent session/job, permit at most 8 pending requests per job, retain at most 50 recent records, cap envelopes and replies at 20,000 UTF-8 bytes, and time out after 120 seconds. Cancellation, process exit, and parent shutdown cancel pending requests; late, duplicate, and cross-session replies fail.
+
+No context fork occurs. The child receives only its delegated task, explicit replies, and steering instructions—not the parent conversation or system prompt. Request/reply telemetry is bounded and may be retained unencrypted in the post-mortem journal under `~/.pi/agent/subagent-journals`; do not send secrets that should not be persisted. Supervisor queues are live-only and never resume across sessions.

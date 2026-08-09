@@ -34,6 +34,8 @@ import { openSubagentInspector } from "./inspector.ts";
 import { loadSubagentLimits, resolveTimeoutMs, type SubagentLimits } from "./settings.ts";
 import { RunJournal } from "./journal.ts";
 import { SteeringRegistry } from "./steering.ts";
+import { EscalationIngress, EscalationRegistry } from "./escalation.ts";
+import { childExtensionArgs, resolveChildExtensions } from "./child-extensions.ts";
 
 const DEFAULT_TOOLS = ["read", "grep", "find", "ls"];
 
@@ -111,6 +113,7 @@ const jobs = new Map<string, SubagentJob>();
 const deliverySuppressed = new Set<string>();
 const jobStore = new JobStore();
 const steering = new SteeringRegistry(jobStore);
+const escalation = new EscalationRegistry(jobStore);
 const mutationLocks = new CwdMutationLock();
 let nextJobNumber = 1;
 
@@ -194,6 +197,7 @@ function createJob(
 		if (job.status === "done" || job.status === "failed" || job.status === "aborted" || job.abortController.signal.aborted) return;
 		job.updatedAt = Date.now();
 		addJobLog(job, "cancellation requested");
+		escalation.closeJob(job.id, "cancellation is in progress");
 		steering.markUnavailable(job.id, "cancellation is in progress");
 		job.abortController.abort();
 	};
@@ -289,6 +293,7 @@ type PreparedTask = {
 	agent: AgentConfig;
 	cwd: string;
 	model: JobModelMetadata;
+	extensionPaths: string[];
 	limits: SubagentLimits;
 	timeoutMs: number;
 };
@@ -325,6 +330,7 @@ function prepareTask(
 		agent,
 		cwd: cwdResult.cwd,
 		model: resolveJobModel(request.model, requestModel, agent.model, inheritedModel),
+		extensionPaths: resolveChildExtensions(agent),
 		limits,
 		timeoutMs: resolveTimeoutMs(request.timeoutMs ?? requestTimeoutMs, limits),
 	};
@@ -427,6 +433,7 @@ async function runRpcAgent(
 	job: SubagentJob,
 	taskCwd: string | undefined,
 	modelMetadata: JobModelMetadata,
+	extensionPaths: readonly string[],
 	signal: AbortSignal | undefined,
 ): Promise<RunResult> {
 	let tempDir: string | undefined;
@@ -448,8 +455,10 @@ async function runRpcAgent(
 	let wasAborted = false;
 	let statsRefreshPending = false;
 	let hasSettled = false;
+	const escalationIngress = new EscalationIngress(escalation, job.id);
 	let unsubscribeRpc: (() => void) | undefined;
 	let unregisterSteering: (() => void) | undefined;
+	let unregisterEscalation: (() => void) | undefined;
 	let abortSignal: AbortSignal | undefined;
 	let abortHandler: (() => void) | undefined;
 	let terminateTimer: NodeJS.Timeout | undefined;
@@ -459,6 +468,7 @@ async function runRpcAgent(
 		const promptPath = join(tempDir, `${agent.name.replace(/[^A-Za-z0-9_.-]+/g, "_")}.md`);
 		await writeFile(promptPath, agent.systemPrompt, { encoding: "utf8", mode: 0o600 });
 		const args = ["--mode", "rpc", "--no-session", "--no-extensions", "--name", job.name, "--append-system-prompt", promptPath];
+		args.push(...childExtensionArgs(extensionPaths));
 		if (modelMetadata.requested) args.push("--model", modelMetadata.requested);
 		args.push("--tools", (agent.tools?.length ? agent.tools : DEFAULT_TOOLS).join(","));
 		const invocation = getPiInvocation(args);
@@ -470,6 +480,7 @@ async function runRpcAgent(
 			env: { ...process.env, PI_SUBAGENT: "1", PI_SUBAGENT_ID: job.id, PI_SUBAGENT_NAME: job.name },
 		});
 		client = new RpcProcessClient(child as ChildProcessWithoutNullStreams, {
+			onExtensionUiRequest: (request) => escalationIngress.handle(request),
 			onStderr: (text) => {
 				result.stderr = (result.stderr + text).slice(-job.limits.logMaxChars);
 				job.stderr = (job.stderr + text).slice(-job.limits.logMaxChars);
@@ -487,10 +498,7 @@ async function runRpcAgent(
 		unsubscribeRpc = client.onEvent((event) => {
 			recordRpcEvent(job, result, event);
 			if (event.type === "transport_error") steering.markUnavailable(job.id, event.message);
-			if (event.type === "agent_settled" && steering.observeSettled(job.id)) {
-				hasSettled = true;
-				job.abort = undefined;
-			}
+			if (event.type === "agent_settled" && steering.observeSettled(job.id)) hasSettled = true;
 			if (event.type === "message_end" || event.type === "tool_execution_end" || event.type === "compaction_end") refreshStats();
 		});
 		const state = await client.getState();
@@ -506,6 +514,7 @@ async function runRpcAgent(
 			if (abortRequested || hasSettled) return;
 			abortRequested = true;
 			wasAborted = true;
+			escalation.closeJob(job.id, "cancellation is in progress");
 			steering.markUnavailable(job.id, "cancellation is in progress");
 			addJobLog(job, "abort requested");
 			if (promptAccepted) void client?.abort().catch(() => {});
@@ -521,6 +530,7 @@ async function runRpcAgent(
 		if (abortSignal.aborted) abortHandler();
 		else abortSignal.addEventListener("abort", abortHandler, { once: true });
 		if (abortRequested) throw new Error("Subagent was aborted before prompting.");
+		escalationIngress.beginPrompt();
 		await client.prompt(`Task: ${job.task}`);
 		promptAccepted = true;
 		if (abortRequested) {
@@ -529,11 +539,15 @@ async function runRpcAgent(
 		}
 		job.status = "working";
 		unregisterSteering = steering.register(job.id, (instruction) => client!.prompt(instruction, "steer"));
+		unregisterEscalation = escalation.register(job.id, {
+			sessionId: jobStore.get(job.id)?.parent.sessionId ?? "unknown",
+			respond: (id, response) => client!.respondExtensionUi(id, response),
+		});
+		escalationIngress.flush((id) => client!.respondExtensionUi(id, { cancelled: true }));
 		addJobLog(job, `working in ${taskCwd ?? cwd}`);
 		if (hasSettled) steering.observeSettled(job.id);
 		await steering.waitForFinalSettlement(job.id, job.timeoutMs);
 		hasSettled = true;
-		job.abort = undefined;
 		const stats = await client.getSessionStats().catch(() => undefined);
 		if (stats) {
 			jobStore.appendTimeline(job.id, { type: "session-stats", totalTokens: stats.tokens.total, cost: stats.cost, at: Date.now() });
@@ -554,6 +568,7 @@ async function runRpcAgent(
 		if (abortSignal && abortHandler) abortSignal.removeEventListener("abort", abortHandler);
 		if (terminateTimer) clearTimeout(terminateTimer);
 		if (killTimer) clearTimeout(killTimer);
+		unregisterEscalation?.();
 		unregisterSteering?.();
 		unsubscribeRpc?.();
 		client?.dispose();
@@ -620,13 +635,14 @@ function runManagedAgent(
 	job: SubagentJob,
 	taskCwd: string | undefined,
 	model: JobModelMetadata,
+	extensionPaths: readonly string[],
 	signal: AbortSignal | undefined,
 ): Promise<RunResult> {
 	const runCwd = resolve(taskCwd ?? cwd);
-	if (!isMutationCapable(agent.tools)) return runRpcAgent(cwd, agent, job, taskCwd, model, signal);
+	if (!isMutationCapable(agent.tools)) return runRpcAgent(cwd, agent, job, taskCwd, model, extensionPaths, signal);
 	const ownerId = mutationLocks.acquire(runCwd, job.id);
 	if (ownerId) return Promise.resolve(mutationLockFailure(job, agent, runCwd, ownerId));
-	return runRpcAgent(cwd, agent, job, taskCwd, model, signal).finally(() => mutationLocks.release(runCwd, job.id));
+	return runRpcAgent(cwd, agent, job, taskCwd, model, extensionPaths, signal).finally(() => mutationLocks.release(runCwd, job.id));
 }
 
 function isFailure(result: RunResult): boolean {
@@ -671,8 +687,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => { sessionContext = ctx; updateStatus(); });
 	pi.on("agent_end", () => { flushResults(); });
 	pi.on("session_shutdown", () => {
+		escalation.clear("parent session shut down");
 		for (const job of jobs.values()) {
-			if (job.abort) deliverySuppressed.add(job.id);
+			if (job.status === "initializing" || job.status === "working") deliverySuppressed.add(job.id);
 			job.abort?.();
 		}
 		sessionContext?.ui.setStatus("subagents", undefined);
@@ -705,7 +722,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			delivery: { mode: "background", method: "deferred-follow-up", consumedByWait: false },
 		});
 		// Background jobs outlive the parent tool turn; explicit subagent_cancel owns their cancellation.
-		job.completion = runManagedAgent(ctx.cwd, prepared.agent, job, prepared.cwd, prepared.model, undefined);
+		job.completion = runManagedAgent(ctx.cwd, prepared.agent, job, prepared.cwd, prepared.model, prepared.extensionPaths, undefined);
 		job.completion.then((result) => {
 			pruneCompletedJobs(limits.completedJobRetention);
 			updateStatus();
@@ -823,6 +840,36 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
+		name: "subagent_requests",
+		label: "Subagent Requests",
+		description: "List pending and recent child-to-parent escalation requests and progress updates for this parent session.",
+		parameters: Type.Object({ jobId: Type.Optional(Type.String({ description: "Optional subagent job id filter" })) }),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const records = escalation.list(ctx.sessionManager.getSessionId(), params.jobId).slice(0, 20).map((record) => ({
+				...record,
+				message: truncateMiddle(record.message, 2_000),
+				...(record.reply ? { reply: truncateMiddle(record.reply, 2_000) } : {}),
+			}));
+			const text = records.length ? records.map((record) => `${record.id} ${record.jobId} ${record.kind} ${record.status}\n${record.subject}: ${record.message}`).join("\n\n") : "No supervisor requests for this session.";
+			return { content: [{ type: "text", text }], details: { records } };
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_reply",
+		label: "Reply to Subagent",
+		description: "Reply to one pending blocking supervisor request. The reply is scoped to this parent session and request id.",
+		parameters: Type.Object({
+			id: Type.String({ description: "Supervisor request correlation id" }),
+			reply: Type.String({ minLength: 1, description: "Reply (maximum 20,000 UTF-8 bytes)" }),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const record = escalation.reply(ctx.sessionManager.getSessionId(), params.id, params.reply);
+			return { content: [{ type: "text", text: `Replied to ${record.id} for ${record.jobId}.` }], details: { id: record.id, jobId: record.jobId, status: record.status } };
+		},
+	});
+
+	pi.registerTool({
 		name: "subagent_steer",
 		label: "Steer Subagent",
 		description: "Queue a mid-flight instruction for a running RPC subagent without restarting it. RPC acceptance confirms delivery to Pi's steering queue, not child compliance.",
@@ -916,7 +963,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					timeoutMs: prepared.timeoutMs,
 					delivery: { mode: deliveryMode, method: "tool-result", consumedByWait: false },
 				});
-				return runManagedAgent(ctx.cwd, prepared.agent, job, prepared.cwd, prepared.model, signal);
+				return runManagedAgent(ctx.cwd, prepared.agent, job, prepared.cwd, prepared.model, prepared.extensionPaths, signal);
 			};
 
 			if (hasSingle) {
