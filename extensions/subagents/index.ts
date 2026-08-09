@@ -15,7 +15,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
@@ -24,6 +24,7 @@ import { extractTextResponse, truncateMiddle } from "../../utils/text.ts";
 import { discoverAgents, type AgentProfile, type AgentScope, type AgentSource } from "./profiles.ts";
 import { truncateOutput as truncateBoundedOutput } from "./output.ts";
 import { isTrustedChildCwd } from "./policy.ts";
+import { CwdMutationLock, isMutationCapable } from "./mutation-lock.ts";
 import { formatActivityStatus } from "./status.ts";
 import { ResultDelivery } from "./result-delivery.ts";
 import { type JobStatus, toJobSnapshot } from "./jobs.ts";
@@ -107,6 +108,7 @@ type SubagentParams = Static<typeof SubagentParamsSchema>;
 const jobs = new Map<string, SubagentJob>();
 const deliverySuppressed = new Set<string>();
 const jobStore = new JobStore();
+const mutationLocks = new CwdMutationLock();
 let nextJobNumber = 1;
 
 function nowIso(): string {
@@ -505,6 +507,48 @@ async function runRpcAgent(
 	return result;
 }
 
+function mutationLockFailure(job: SubagentJob, agent: AgentConfig, lockedCwd: string, ownerId: string): RunResult {
+	const output = `Cannot start mutation-capable subagent in ${lockedCwd}: ${ownerId} already owns that working directory.`;
+	const finishedAt = Date.now();
+	job.status = "failed";
+	job.exitCode = 1;
+	job.output = output;
+	job.errorMessage = output;
+	job.finishedAt = finishedAt;
+	job.updatedAt = finishedAt;
+	jobStore.setOutput(job.id, output);
+	addJobLog(job, output);
+	pruneCompletedJobs();
+	return {
+		id: job.id,
+		name: job.name,
+		agent: agent.name,
+		source: agent.source,
+		task: job.task,
+		status: "failed",
+		exitCode: 1,
+		output,
+		stderr: "",
+		messages: [],
+		errorMessage: output,
+	};
+}
+
+function runManagedAgent(
+	cwd: string,
+	agent: AgentConfig,
+	job: SubagentJob,
+	taskCwd: string | undefined,
+	model: JobModelMetadata,
+	signal: AbortSignal | undefined,
+): Promise<RunResult> {
+	const runCwd = resolve(taskCwd ?? cwd);
+	if (!isMutationCapable(agent.tools)) return runRpcAgent(cwd, agent, job, taskCwd, model, signal);
+	const ownerId = mutationLocks.acquire(runCwd, job.id);
+	if (ownerId) return Promise.resolve(mutationLockFailure(job, agent, runCwd, ownerId));
+	return runRpcAgent(cwd, agent, job, taskCwd, model, signal).finally(() => mutationLocks.release(runCwd, job.id));
+}
+
 function isFailure(result: RunResult): boolean {
 	return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
 }
@@ -583,7 +627,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			delivery: { mode: "background", method: "deferred-follow-up", consumedByWait: false },
 		});
 		// Background jobs outlive the parent tool turn; explicit subagent_cancel owns their cancellation.
-		job.completion = runRpcAgent(ctx.cwd, agent, job, cwdResult.cwd, model, undefined);
+		job.completion = runManagedAgent(ctx.cwd, agent, job, cwdResult.cwd, model, undefined);
 		job.completion.then((result) => {
 			pruneCompletedJobs();
 			updateStatus();
@@ -827,7 +871,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 						messages: [],
 					} satisfies RunResult;
 				}
-				return runRpcAgent(ctx.cwd, agent, job, cwdResult.cwd, model, signal);
+				return runManagedAgent(ctx.cwd, agent, job, cwdResult.cwd, model, signal);
 			};
 
 			if (hasSingle) {

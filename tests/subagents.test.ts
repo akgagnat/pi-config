@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 import { formatActivityStatus } from "../extensions/subagents/status.ts";
 import { isTrustedChildCwd } from "../extensions/subagents/policy.ts";
+import { CwdMutationLock, isMutationCapable } from "../extensions/subagents/mutation-lock.ts";
 import { truncateOutput } from "../extensions/subagents/output.ts";
 import { ResultDelivery } from "../extensions/subagents/result-delivery.ts";
 import { JobManager, toJobSnapshot } from "../extensions/subagents/jobs.ts";
@@ -21,6 +22,18 @@ test("child cwd policy keeps profile agents inside the trusted parent project", 
 	assert.equal(isTrustedChildCwd("/work/project", "/work/project"), true);
 	assert.equal(isTrustedChildCwd("/work/project", "/work/project/packages/app"), true);
 	assert.equal(isTrustedChildCwd("/work/project", "/work/other"), false);
+});
+
+test("mutation-capable profiles are exclusive per normalized working directory", () => {
+	const locks = new CwdMutationLock();
+	assert.equal(isMutationCapable(["read", "grep"]), false);
+	assert.equal(isMutationCapable(["read", "bash"]), true);
+	assert.equal(locks.acquire("/work/project", "sa-1"), undefined);
+	assert.equal(locks.acquire("/work/project/packages/..", "sa-2"), "sa-1");
+	locks.release("/work/project", "sa-2");
+	assert.equal(locks.acquire("/work/project", "sa-3"), "sa-1");
+	locks.release("/work/project", "sa-1");
+	assert.equal(locks.acquire("/work/project", "sa-3"), undefined);
 });
 
 test("output truncation respects UTF-8 byte and line limits", () => {
