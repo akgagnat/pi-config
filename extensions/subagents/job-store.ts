@@ -65,13 +65,14 @@ export type JobSnapshot = {
 	readonly delivery: JobDeliveryMetadata;
 	readonly timeline: readonly DeepReadonly<TelemetryEvent>[];
 	readonly droppedTimelineEvents: number;
+	readonly droppedSteeringEvents: number;
 	readonly stderr: BoundedTextSnapshot;
 	readonly output: BoundedTextSnapshot;
 };
 
 export type CreateJobInput = Omit<
 	JobSnapshot,
-	"status" | "startedAt" | "updatedAt" | "finishedAt" | "timeline" | "droppedTimelineEvents" | "stderr" | "output"
+	"status" | "startedAt" | "updatedAt" | "finishedAt" | "timeline" | "droppedTimelineEvents" | "droppedSteeringEvents" | "stderr" | "output"
 > & {
 	status?: JobStatus;
 	startedAt?: number;
@@ -89,6 +90,7 @@ export type JobStoreListener = (change: JobStoreChange) => void;
 
 export type JobStoreOptions = {
 	maxTimelineEvents?: number;
+	maxSteeringEvents?: number;
 	maxStderrBytes?: number;
 	maxOutputBytes?: number;
 	maxCompletedJobs?: number;
@@ -111,6 +113,7 @@ type MutableJob = Omit<Mutable<JobSnapshot>, "timeline" | "stderr" | "output"> &
 
 const TERMINAL_STATUSES = new Set<JobStatus>(["done", "failed", "aborted"]);
 const DEFAULT_MAX_TIMELINE_EVENTS = 500;
+const DEFAULT_MAX_STEERING_EVENTS = 50;
 const DEFAULT_MAX_STDERR_BYTES = 40_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 20_000;
 const DEFAULT_MAX_COMPLETED_JOBS = 20;
@@ -165,6 +168,11 @@ function boundTelemetryEvent(event: TelemetryEvent): TelemetryEvent {
 		return { ...clone, partialResult: "[partial tool result omitted: over 8KB]" };
 	}
 	if (clone.type === "activity") return { ...clone, message: bytePrefix(clone.message, 2_000) };
+	if (clone.type === "steering") return {
+		...clone,
+		instruction: bytePrefix(clone.instruction, 20_000),
+		...(clone.message ? { message: bytePrefix(clone.message, 2_000) } : {}),
+	};
 	return clone;
 }
 
@@ -185,6 +193,7 @@ export class JobStore {
 	private readonly completedJobIds: string[] = [];
 	private readonly listeners = new Set<JobStoreListener>();
 	private readonly maxTimelineEvents: number;
+	private readonly maxSteeringEvents: number;
 	private readonly maxStderrBytes: number;
 	private readonly maxOutputBytes: number;
 	private maxCompletedJobs: number;
@@ -192,11 +201,13 @@ export class JobStore {
 
 	constructor(options: JobStoreOptions = {}) {
 		this.maxTimelineEvents = options.maxTimelineEvents ?? DEFAULT_MAX_TIMELINE_EVENTS;
+		this.maxSteeringEvents = options.maxSteeringEvents ?? DEFAULT_MAX_STEERING_EVENTS;
 		this.maxStderrBytes = options.maxStderrBytes ?? DEFAULT_MAX_STDERR_BYTES;
 		this.maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
 		this.maxCompletedJobs = options.maxCompletedJobs ?? DEFAULT_MAX_COMPLETED_JOBS;
 		this.now = options.now ?? Date.now;
 		assertLimit("maxTimelineEvents", this.maxTimelineEvents);
+		assertLimit("maxSteeringEvents", this.maxSteeringEvents);
 		assertLimit("maxStderrBytes", this.maxStderrBytes);
 		assertLimit("maxOutputBytes", this.maxOutputBytes);
 		assertLimit("maxCompletedJobs", this.maxCompletedJobs);
@@ -213,6 +224,7 @@ export class JobStore {
 			updatedAt: startedAt,
 			timeline: [],
 			droppedTimelineEvents: 0,
+			droppedSteeringEvents: 0,
 			stderr: { text: "", totalBytes: 0, truncated: false },
 			output: { text: "", totalBytes: 0, truncated: false },
 		};
@@ -274,10 +286,20 @@ export class JobStore {
 		} else {
 			job.timeline.push(bounded);
 		}
+		if (bounded.type === "steering") {
+			let steeringCount = job.timeline.reduce((count, item) => count + Number(item.type === "steering"), 0);
+			for (let index = 0; steeringCount > this.maxSteeringEvents && index < job.timeline.length;) {
+				if (job.timeline[index].type !== "steering") { index++; continue; }
+				job.timeline.splice(index, 1);
+				job.droppedSteeringEvents++;
+				steeringCount--;
+			}
+		}
 		if (job.timeline.length > this.maxTimelineEvents) {
 			const dropped = job.timeline.length - this.maxTimelineEvents;
-			job.timeline.splice(0, dropped);
+			const removed = job.timeline.splice(0, dropped);
 			job.droppedTimelineEvents += dropped;
+			job.droppedSteeringEvents += removed.reduce((count, item) => count + Number(item.type === "steering"), 0);
 		}
 		return this.touch(job);
 	}

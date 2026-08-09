@@ -51,6 +51,32 @@ test("RPC client correlates responses without emitting them as events", async ()
 	client.dispose();
 });
 
+test("RPC client reports steering acceptance and RPC rejection", async () => {
+	const child = fakeChild();
+	const client = new RpcProcessClient(child);
+	let written = nextWrittenJson(child.stdin);
+	const accepted = client.steer("Focus on tests");
+	let request = await written;
+	assert.equal(request.type, "steer");
+	child.stdout.write(`${JSON.stringify({ type: "response", id: request.id, command: "steer", success: true })}\n`);
+	await accepted;
+
+	written = nextWrittenJson(child.stdin);
+	const prompted = client.prompt("Focus on the race", "steer");
+	request = await written;
+	assert.equal(request.type, "prompt");
+	assert.equal(request.streamingBehavior, "steer");
+	child.stdout.write(`${JSON.stringify({ type: "response", id: request.id, command: "prompt", success: true })}\n`);
+	await prompted;
+
+	written = nextWrittenJson(child.stdin);
+	const rejected = client.steer("Stop editing");
+	request = await written;
+	child.stdout.write(`${JSON.stringify({ type: "response", id: request.id, command: "steer", success: false, error: "not streaming" })}\n`);
+	await assert.rejects(rejected, /not streaming/);
+	client.dispose();
+});
+
 test("RPC client emits fragmented LF-delimited events", async () => {
 	const child = fakeChild();
 	const client = new RpcProcessClient(child);

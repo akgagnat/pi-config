@@ -54,6 +54,7 @@ export function formatInspectorActivity(event: DeepReadonly<TelemetryEvent>): st
 		case "compaction": return `${prefix}  compaction ${event.phase} (${event.reason})`;
 		case "context": return `${prefix}  context ${event.tokens === null ? "unknown" : formatCount(event.tokens)}/${formatCount(event.contextWindow)}${event.percent === null ? "" : ` (${event.percent.toFixed(1)}%)`}`;
 		case "session-stats": return `${prefix}  usage ${formatCount(event.totalTokens)} tokens · $${event.cost.toFixed(4)}`;
+		case "steering": return `${prefix}  steer ${event.steeringId} ${event.outcome}`;
 		case "agent-end": return `${prefix}  agent ended${event.stopReason ? ` (${event.stopReason})` : ""}`;
 		default: return undefined;
 	}
@@ -98,6 +99,12 @@ export function getInspectorDetailLines(job: JobSnapshot, view: InspectorView, s
 		return lines;
 	}
 	if (view === "Communication") {
+		const steeringLines = job.timeline
+			.filter((event) => event.type === "steering")
+			.flatMap((event) => [
+				`  ${eventTime(event)} ${event.steeringId} ${event.outcome}: ${safeText(event.instruction)}`,
+				...(event.message ? [`    ${safeText(event.message)}`] : []),
+			]);
 		return [
 			"Parent → child",
 			`  parent session: ${job.parent.sessionId ?? "unknown"}`,
@@ -106,6 +113,10 @@ export function getInspectorDetailLines(job: JobSnapshot, view: InspectorView, s
 			`  agent profile: ${job.agent}`,
 			`  model source: ${job.model.source}`,
 			`  task: ${safeText(job.task)}`,
+			"",
+			"Steering ledger",
+			...(job.droppedSteeringEvents ? [`  … ${job.droppedSteeringEvents} earlier steering events omitted`] : []),
+			...(steeringLines.length ? steeringLines : ["  (none)"]),
 			"",
 			"Child → parent",
 			`  method: ${job.delivery.method}`,

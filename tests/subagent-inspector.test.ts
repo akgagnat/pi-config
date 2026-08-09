@@ -22,6 +22,8 @@ function inspectedJob() {
 	store.appendTimeline("sa-1", { type: "text-delta", contentIndex: 1, delta: "Review complete", at: 5 });
 	store.appendTimeline("sa-1", { type: "context", tokens: 42_000, contextWindow: 200_000, percent: 21, contextQuality: "estimated", at: 6 });
 	store.appendTimeline("sa-1", { type: "session-stats", totalTokens: 50_000, cost: 0.125, at: 7 });
+	store.appendTimeline("sa-1", { type: "steering", steeringId: "steer-0001", instruction: "Focus on race handling", outcome: "requested", at: 8 });
+	store.appendTimeline("sa-1", { type: "steering", steeringId: "steer-0001", instruction: "Focus on race handling", outcome: "accepted", message: "queued; compliance is not guaranteed", at: 9 });
 	return store.get("sa-1")!;
 }
 
@@ -68,7 +70,10 @@ test("inspector hides thinking unless explicitly enabled", () => {
 
 test("inspector distinguishes communication and context metadata", () => {
 	const job = inspectedJob();
-	assert.match(getInspectorDetailLines(job, "Communication", false).join("\n"), /parent tool call: call-1/);
+	const communication = getInspectorDetailLines(job, "Communication", false).join("\n");
+	assert.match(communication, /parent tool call: call-1/);
+	assert.match(communication, /steer-0001 accepted: Focus on race handling/);
+	assert.match(communication, /compliance is not guaranteed/);
 	const metadata = getInspectorDetailLines(job, "Metadata", false).join("\n");
 	assert.match(metadata, /42k\/200k \(21\.0%\) · estimated/);
 	assert.match(metadata, /50k tokens · \$0\.1250/);

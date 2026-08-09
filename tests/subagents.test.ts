@@ -108,6 +108,11 @@ test("rejected subagent requests do not create jobs", async () => {
 		tools.get("subagent_spawn").execute("call", { agent: "general", task: "do work" }, undefined, undefined, ctx),
 		/Unknown agent/,
 	);
+	assert.equal(tools.has("subagent_steer"), true);
+	await assert.rejects(
+		tools.get("subagent_steer").execute("call", { id: "missing", instruction: "Continue" }),
+		/Unknown subagent job/,
+	);
 	const foreground = await tools.get("subagent").execute("call", { agent: "general", task: "do work" }, undefined, undefined, ctx);
 	assert.equal(foreground.isError, true);
 	const batch = await tools.get("subagent").execute("call", { tasks: [{ agent: "general", task: "do work" }] }, undefined, undefined, ctx);

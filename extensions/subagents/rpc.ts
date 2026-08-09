@@ -76,8 +76,14 @@ export class RpcProcessClient {
 		return data.messages;
 	}
 
-	async prompt(message: string): Promise<void> {
-		await this.request({ type: "prompt", message });
+	async prompt(message: string, streamingBehavior?: "steer" | "followUp"): Promise<void> {
+		const response = await this.request({ type: "prompt", message, ...(streamingBehavior ? { streamingBehavior } : {}) });
+		if (!response.success) throw new Error(response.error);
+	}
+
+	async steer(message: string): Promise<void> {
+		const response = await this.request({ type: "steer", message });
+		if (!response.success) throw new Error(response.error);
 	}
 
 	async abort(): Promise<void> {

@@ -33,6 +33,7 @@ import { RpcProcessClient, type RpcProcessEvent } from "./rpc.ts";
 import { openSubagentInspector } from "./inspector.ts";
 import { loadSubagentLimits, resolveTimeoutMs, type SubagentLimits } from "./settings.ts";
 import { RunJournal } from "./journal.ts";
+import { SteeringRegistry } from "./steering.ts";
 
 const DEFAULT_TOOLS = ["read", "grep", "find", "ls"];
 
@@ -109,6 +110,7 @@ type SubagentParams = Static<typeof SubagentParamsSchema>;
 const jobs = new Map<string, SubagentJob>();
 const deliverySuppressed = new Set<string>();
 const jobStore = new JobStore();
+const steering = new SteeringRegistry(jobStore);
 const mutationLocks = new CwdMutationLock();
 let nextJobNumber = 1;
 
@@ -192,6 +194,7 @@ function createJob(
 		if (job.status === "done" || job.status === "failed" || job.status === "aborted" || job.abortController.signal.aborted) return;
 		job.updatedAt = Date.now();
 		addJobLog(job, "cancellation requested");
+		steering.markUnavailable(job.id, "cancellation is in progress");
 		job.abortController.abort();
 	};
 	addJobLog(job, `created job ${id} (${name})`);
@@ -444,7 +447,9 @@ async function runRpcAgent(
 	let client: RpcProcessClient | undefined;
 	let wasAborted = false;
 	let statsRefreshPending = false;
+	let hasSettled = false;
 	let unsubscribeRpc: (() => void) | undefined;
+	let unregisterSteering: (() => void) | undefined;
 	let abortSignal: AbortSignal | undefined;
 	let abortHandler: (() => void) | undefined;
 	let terminateTimer: NodeJS.Timeout | undefined;
@@ -481,6 +486,11 @@ async function runRpcAgent(
 		};
 		unsubscribeRpc = client.onEvent((event) => {
 			recordRpcEvent(job, result, event);
+			if (event.type === "transport_error") steering.markUnavailable(job.id, event.message);
+			if (event.type === "agent_settled" && steering.observeSettled(job.id)) {
+				hasSettled = true;
+				job.abort = undefined;
+			}
 			if (event.type === "message_end" || event.type === "tool_execution_end" || event.type === "compaction_end") refreshStats();
 		});
 		const state = await client.getState();
@@ -489,15 +499,14 @@ async function runRpcAgent(
 			result.model = job.model;
 			jobStore.update(job.id, { model: { ...modelMetadata, provider: state.model.provider, id: state.model.id, contextWindow: state.model.contextWindow, thinkingLevel: state.thinkingLevel } });
 		}
-		job.status = "working";
-		addJobLog(job, `working in ${taskCwd ?? cwd}`);
 		abortSignal = signal ? AbortSignal.any([signal, job.abortController.signal]) : job.abortController.signal;
 		let promptAccepted = false;
 		let abortRequested = false;
 		abortHandler = () => {
-			if (abortRequested) return;
+			if (abortRequested || hasSettled) return;
 			abortRequested = true;
 			wasAborted = true;
+			steering.markUnavailable(job.id, "cancellation is in progress");
 			addJobLog(job, "abort requested");
 			if (promptAccepted) void client?.abort().catch(() => {});
 			terminateTimer = setTimeout(() => {
@@ -512,12 +521,19 @@ async function runRpcAgent(
 		if (abortSignal.aborted) abortHandler();
 		else abortSignal.addEventListener("abort", abortHandler, { once: true });
 		if (abortRequested) throw new Error("Subagent was aborted before prompting.");
-		const settled = client.waitForSettled(job.timeoutMs);
-		void settled.catch(() => {});
 		await client.prompt(`Task: ${job.task}`);
 		promptAccepted = true;
-		if (abortRequested) await client.abort().catch(() => {});
-		await settled;
+		if (abortRequested) {
+			await client.abort().catch(() => {});
+			throw new Error("Subagent was aborted while prompting.");
+		}
+		job.status = "working";
+		unregisterSteering = steering.register(job.id, (instruction) => client!.prompt(instruction, "steer"));
+		addJobLog(job, `working in ${taskCwd ?? cwd}`);
+		if (hasSettled) steering.observeSettled(job.id);
+		await steering.waitForFinalSettlement(job.id, job.timeoutMs);
+		hasSettled = true;
+		job.abort = undefined;
 		const stats = await client.getSessionStats().catch(() => undefined);
 		if (stats) {
 			jobStore.appendTimeline(job.id, { type: "session-stats", totalTokens: stats.tokens.total, cost: stats.cost, at: Date.now() });
@@ -538,6 +554,7 @@ async function runRpcAgent(
 		if (abortSignal && abortHandler) abortSignal.removeEventListener("abort", abortHandler);
 		if (terminateTimer) clearTimeout(terminateTimer);
 		if (killTimer) clearTimeout(killTimer);
+		unregisterSteering?.();
 		unsubscribeRpc?.();
 		client?.dispose();
 		if (child && child.exitCode === null && child.signalCode === null) {
@@ -801,6 +818,28 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				content: [{ type: "text", text: results.map((result) => `## ${result.id} ${result.name} — ${result.status}\n\n${result.output}`).join("\n\n---\n\n") }],
 				details: { results: results.map(resultDetails) },
 				isError: results.some(isFailure),
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_steer",
+		label: "Steer Subagent",
+		description: "Queue a mid-flight instruction for a running RPC subagent without restarting it. RPC acceptance confirms delivery to Pi's steering queue, not child compliance.",
+		promptSnippet: "Send a mid-flight instruction to a running subagent.",
+		promptGuidelines: [
+			"Use subagent_steer only for a running child that needs changed or clarified instructions.",
+			"Treat an accepted subagent_steer result as queue delivery, not proof that the child complied.",
+		],
+		parameters: Type.Object({
+			id: Type.String({ description: "Running subagent job id" }),
+			instruction: Type.String({ minLength: 1, description: "Instruction to queue for the child (maximum 20,000 UTF-8 bytes)" }),
+		}),
+		async execute(_toolCallId, params) {
+			const result = await steering.deliver(params.id, params.instruction);
+			return {
+				content: [{ type: "text", text: `${result.jobId} ${result.outcome}: ${result.message}` }],
+				details: result,
 			};
 		},
 	});

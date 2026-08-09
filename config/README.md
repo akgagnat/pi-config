@@ -60,3 +60,9 @@ Point Pi at the whole `extensions/` directory.
 Completed runs are also written best-effort to `~/.pi/agent/subagent-journals/<uuid>/`. Each private (`0700`) directory contains versioned `status.json`, bounded `events.jsonl`, `output.txt`, and `stderr.txt` files (`0600`). The journal is a post-mortem projection only: it is not a queue, does not resume a child, and children still terminate when their parent session shuts down. Artifact writes and cleanup never block or fail a live child; malformed or partial artifacts are ignored by the read-only reader seam for the future inspector.
 
 Unsupported fields or invalid values cause subagent launch to fail with a clear error; they never silently select another value. `timeoutMs` may also be supplied per `subagent` or `subagent_spawn` call and uses the same 1,000–7,200,000 ms bounds.
+
+## Mid-flight steering
+
+`subagent_steer` sends an instruction to an existing **working** RPC child through Pi's `steer` command. A successful result means the child RPC process accepted the instruction into its steering queue; it does not prove that the model read or complied with it. Steering never restarts, replaces, resumes, or revives a child.
+
+Unknown, initializing, completed, failed, aborted, and cancellation-in-progress jobs are rejected. If cancellation begins after a steer has already been written, that delivery may still be reported as accepted, but cancellation continues and the child is still terminated. RPC rejection and process-exit races are reported as failed delivery. Requested and final delivery outcomes are retained in a bounded steering ledger and shown in the inspector's Communication view; instructions are also part of the bounded journal telemetry.
