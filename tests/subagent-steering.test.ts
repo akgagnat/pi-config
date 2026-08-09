@@ -81,6 +81,17 @@ test("settlement observed during an in-flight steer waits for post-acceptance se
 	assert.equal(finalized, true);
 });
 
+test("settlement timeout rejects once and channel cleanup remains idempotent", async () => {
+	const store = new JobStore();
+	createWorkingJob(store);
+	const steering = new SteeringRegistry(store);
+	steering.register("sa-1", async () => {});
+	await assert.rejects(steering.waitForFinalSettlement("sa-1", 5), /Timed out waiting/);
+	steering.markUnavailable("sa-1", "timed out");
+	steering.markUnavailable("sa-1", "timed out again");
+	await assert.rejects(steering.deliver("sa-1", "late"), /timed out/);
+});
+
 test("cancellation race never reopens a terminating channel", async () => {
 	const store = new JobStore();
 	createWorkingJob(store);

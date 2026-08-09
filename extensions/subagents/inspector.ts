@@ -136,6 +136,10 @@ export function getInspectorDetailLines(job: JobSnapshot, view: InspectorView, s
 			`  original output: ${job.delivery.originalOutputBytes ?? 0} bytes`,
 			`  delivered output: ${job.delivery.deliveredOutputBytes ?? 0} bytes`,
 			`  truncated: ${job.delivery.outputTruncated ? "yes" : "no"}`,
+			...(job.delivery.outputArtifact ? [
+				`  file-only artifact: ${safeText(job.delivery.outputArtifact.path)}`,
+				`  artifact bytes: ${job.delivery.outputArtifact.storedBytes}/${job.delivery.outputArtifact.originalBytes}`,
+			] : []),
 		];
 	}
 	const context = latest(job, "context");

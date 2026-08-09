@@ -31,6 +31,13 @@ export type JobDeliveryMetadata = {
 	readonly originalOutputBytes?: number;
 	readonly deliveredOutputBytes?: number;
 	readonly outputTruncated?: boolean;
+	readonly outputArtifact?: {
+		readonly artifactId: string;
+		readonly path: string;
+		readonly originalBytes: number;
+		readonly storedBytes: number;
+		readonly truncated: boolean;
+	};
 };
 
 export type DeepReadonly<T> = T extends (...args: never[]) => unknown
@@ -161,13 +168,22 @@ function boundTelemetryEvent(event: TelemetryEvent): TelemetryEvent {
 		text: bytePrefix(clone.text, 20_000),
 		...(clone.thinking ? { thinking: bytePrefix(clone.thinking, 10_000) } : {}),
 	};
-	if (clone.type === "tool-start" && Buffer.byteLength(JSON.stringify(clone.args), "utf8") > 8_000) {
-		return { ...clone, args: "[tool arguments omitted: over 8KB]" };
-	}
-	if (clone.type === "tool-update" && Buffer.byteLength(JSON.stringify(clone.partialResult), "utf8") > 8_000) {
-		return { ...clone, partialResult: "[partial tool result omitted: over 8KB]" };
-	}
+	if (clone.type === "tool-start") return {
+		...clone,
+		id: bytePrefix(clone.id, 500),
+		name: bytePrefix(clone.name, 500),
+		...(Buffer.byteLength(JSON.stringify(clone.args), "utf8") > 8_000 ? { args: "[tool arguments omitted: over 8KB]" } : {}),
+	};
+	if (clone.type === "tool-update") return {
+		...clone,
+		id: bytePrefix(clone.id, 500),
+		...(Buffer.byteLength(JSON.stringify(clone.partialResult), "utf8") > 8_000 ? { partialResult: "[partial tool result omitted: over 8KB]" } : {}),
+	};
+	if (clone.type === "tool-end") return { ...clone, id: bytePrefix(clone.id, 500), name: bytePrefix(clone.name, 500) };
 	if (clone.type === "activity") return { ...clone, message: bytePrefix(clone.message, 2_000) };
+	if (clone.type === "status") return { ...clone, ...(clone.message ? { message: bytePrefix(clone.message, 2_000) } : {}) };
+	if (clone.type === "compaction") return { ...clone, reason: bytePrefix(clone.reason, 2_000) };
+	if (clone.type === "agent-end") return { ...clone, ...(clone.errorMessage ? { errorMessage: bytePrefix(clone.errorMessage, 2_000) } : {}) };
 	if (clone.type === "steering") return {
 		...clone,
 		instruction: bytePrefix(clone.instruction, 20_000),

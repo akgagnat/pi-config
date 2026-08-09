@@ -52,12 +52,15 @@ test("subagent limits use safe defaults and reject unsupported or unsafe setting
 	assert.throws(() => resolveTimeoutMs(999, DEFAULT_SUBAGENT_LIMITS), /Invalid timeoutMs/);
 });
 
-test("output truncation respects UTF-8 byte and line limits", () => {
-	assert.deepEqual(truncateOutput("one\ntwo\nthree", { maxBytes: 100, maxLines: 2 }), {
-		text: "one\ntwo\n\n[Output truncated: 2 of 3 lines shown.]",
-		truncated: true,
-	});
-	assert.equal(truncateOutput("ééé", { maxBytes: 4, maxLines: 10 }).text, "éé\n\n[Output truncated: 4 of 6 bytes shown.]");
+test("output truncation keeps its marker inside UTF-8 byte and line limits", () => {
+	const lineLimited = truncateOutput("one\ntwo\nthree", { maxBytes: 100, maxLines: 2 });
+	assert.equal(lineLimited.truncated, true);
+	assert.equal(lineLimited.text.split("\n").length, 2);
+	assert.match(lineLimited.text, /Output truncated/);
+	assert.ok(Buffer.byteLength(lineLimited.text, "utf8") <= 100);
+	const byteLimited = truncateOutput("ééé", { maxBytes: 4, maxLines: 10 });
+	assert.equal(byteLimited.truncated, true);
+	assert.ok(Buffer.byteLength(byteLimited.text, "utf8") <= 4);
 });
 
 test("result delivery defers completed jobs and lets an explicit wait consume them", () => {
@@ -111,6 +114,8 @@ test("rejected subagent requests do not create jobs", async () => {
 	assert.equal(tools.has("subagent_steer"), true);
 	assert.equal(tools.has("subagent_requests"), true);
 	assert.equal(tools.has("subagent_reply"), true);
+	assert.ok(tools.get("subagent").parameters.properties.outputMode);
+	assert.ok(tools.get("subagent").parameters.properties.tasks.items.properties.outputMode);
 	await assert.rejects(
 		tools.get("subagent_steer").execute("call", { id: "missing", instruction: "Continue" }),
 		/Unknown subagent job/,

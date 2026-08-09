@@ -16,7 +16,7 @@ import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
-import type { Message } from "@earendil-works/pi-ai";
+import { StringEnum, type Message } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { validateCwd } from "../../utils/cwd.ts";
@@ -38,8 +38,10 @@ import { EscalationIngress, EscalationRegistry } from "./escalation.ts";
 import { childExtensionArgs, resolveChildExtensions } from "./child-extensions.ts";
 import { ActiveJobWidget } from "./active-widget.ts";
 import { CompletionBatcher } from "./completion-batcher.ts";
+import { formatOutputArtifactReceipt, type OutputArtifact, writeOutputArtifact } from "./output-artifact.ts";
 
 const DEFAULT_TOOLS = ["read", "grep", "find", "ls"];
+type OutputMode = "inline" | "file-only";
 
 type AgentConfig = AgentProfile;
 type SubagentJob = {
@@ -64,6 +66,8 @@ type SubagentJob = {
 	abort?: () => void;
 	limits: SubagentLimits;
 	timeoutMs: number;
+	outputMode: OutputMode;
+	journal: RunJournal;
 };
 
 type RunResult = {
@@ -80,6 +84,8 @@ type RunResult = {
 	model?: string;
 	stopReason?: string;
 	errorMessage?: string;
+	outputMode: OutputMode;
+	artifact?: OutputArtifact;
 };
 
 const TaskSchema = Type.Object({
@@ -89,6 +95,7 @@ const TaskSchema = Type.Object({
 	cwd: Type.Optional(Type.String({ description: "Working directory for this subagent" })),
 	model: Type.Optional(Type.String({ description: "Model to use for this subagent job. Defaults to the main agent model." })),
 	timeoutMs: Type.Optional(Type.Integer({ description: "Maximum runtime in milliseconds. Defaults to subagents.defaultTimeoutMs." })),
+	outputMode: Type.Optional(StringEnum(["inline", "file-only"] as const, { description: "Inline report or concise pointer to a private bounded output artifact." })),
 });
 
 const SubagentParamsSchema = Type.Object({
@@ -97,6 +104,7 @@ const SubagentParamsSchema = Type.Object({
 	name: Type.Optional(Type.String({ description: "Human-readable name for the single subagent job" })),
 	model: Type.Optional(Type.String({ description: "Model to use for the subagent. Defaults to the main agent model." })),
 	timeoutMs: Type.Optional(Type.Integer({ description: "Maximum runtime in milliseconds. Defaults to subagents.defaultTimeoutMs." })),
+	outputMode: Type.Optional(StringEnum(["inline", "file-only"] as const, { description: "Inline report or concise pointer to a private bounded output artifact." })),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the subagent." })),
 	tasks: Type.Optional(Type.Array(TaskSchema, { description: "Small parallel batch of delegated tasks" })),
 	scope: Type.Optional(
@@ -160,6 +168,7 @@ function createJob(
 		model?: JobModelMetadata;
 		limits: SubagentLimits;
 		timeoutMs: number;
+		outputMode: OutputMode;
 		delivery?: JobDeliveryMetadata;
 	},
 ): SubagentJob {
@@ -167,6 +176,7 @@ function createJob(
 	const taskPreview = task.replace(/\s+/g, " ").trim().slice(0, 48);
 	const name = requestedName?.trim() || `${agent}:${taskPreview || id}`;
 	const startedAt = Date.now();
+	const journal = new RunJournal(jobStore, id, metadata.limits);
 	const job: SubagentJob = {
 		id,
 		name,
@@ -181,6 +191,8 @@ function createJob(
 		abortController: new AbortController(),
 		limits: metadata.limits,
 		timeoutMs: metadata.timeoutMs,
+		outputMode: metadata.outputMode,
+		journal,
 	};
 	jobStore.setCompletedJobRetention(metadata.limits.completedJobRetention);
 	jobStore.create({
@@ -194,7 +206,7 @@ function createJob(
 		delivery: metadata.delivery ?? { mode: "foreground", method: "tool-result", consumedByWait: false },
 		startedAt,
 	});
-	new RunJournal(jobStore, id, metadata.limits).start();
+	job.journal.start();
 	job.abort = () => {
 		if (job.status === "done" || job.status === "failed" || job.status === "aborted" || job.abortController.signal.aborted) return;
 		job.updatedAt = Date.now();
@@ -288,6 +300,7 @@ type TaskRequest = {
 	name?: string;
 	model?: string;
 	timeoutMs?: number;
+	outputMode?: OutputMode;
 };
 
 type PreparedTask = {
@@ -298,6 +311,7 @@ type PreparedTask = {
 	extensionPaths: string[];
 	limits: SubagentLimits;
 	timeoutMs: number;
+	outputMode: OutputMode;
 };
 
 function activeJobCount(): number {
@@ -317,6 +331,7 @@ function prepareTask(
 	request: TaskRequest,
 	requestModel: string | undefined,
 	requestTimeoutMs: number | undefined,
+	requestOutputMode: OutputMode | undefined,
 	limits: SubagentLimits,
 ): PreparedTask {
 	const cwdResult = validateCwd(ctx.cwd, request.cwd);
@@ -335,6 +350,7 @@ function prepareTask(
 		extensionPaths: resolveChildExtensions(agent),
 		limits,
 		timeoutMs: resolveTimeoutMs(request.timeoutMs ?? requestTimeoutMs, limits),
+		outputMode: request.outputMode ?? requestOutputMode ?? "inline",
 	};
 }
 
@@ -346,7 +362,7 @@ function logJsonEvent(job: SubagentJob, event: any): void {
 	if (event.type === "message_end" && event.message?.role) {
 		const message = event.message as Message;
 		if (message.role === "assistant") {
-			const text = truncateMiddle(getFinalAssistantOutput([message]), 500);
+			const text = job.outputMode === "file-only" ? "" : truncateMiddle(getFinalAssistantOutput([message]), 500);
 			addJobLog(job, text ? `assistant: ${text}` : "assistant message_end");
 			return;
 		}
@@ -451,8 +467,21 @@ async function runRpcAgent(
 		stderr: "",
 		messages: [],
 		model: modelMetadata.requested,
+		outputMode: job.outputMode,
 	};
 	let child: ReturnType<typeof spawn> | undefined;
+	let sigtermSent = false;
+	let sigkillSent = false;
+	const terminateChild = () => {
+		if (sigtermSent || !child || child.exitCode !== null || child.signalCode !== null) return;
+		sigtermSent = true;
+		child.kill("SIGTERM");
+	};
+	const killChild = () => {
+		if (sigkillSent || !child || child.exitCode !== null || child.signalCode !== null) return;
+		sigkillSent = true;
+		child.kill("SIGKILL");
+	};
 	let client: RpcProcessClient | undefined;
 	let wasAborted = false;
 	let statsRefreshPending = false;
@@ -482,6 +511,7 @@ async function runRpcAgent(
 			env: { ...process.env, PI_SUBAGENT: "1", PI_SUBAGENT_ID: job.id, PI_SUBAGENT_NAME: job.name },
 		});
 		client = new RpcProcessClient(child as ChildProcessWithoutNullStreams, {
+			terminateProcess: terminateChild,
 			onExtensionUiRequest: (request) => escalationIngress.handle(request),
 			onStderr: (text) => {
 				result.stderr = (result.stderr + text).slice(-job.limits.logMaxChars);
@@ -520,12 +550,8 @@ async function runRpcAgent(
 			steering.markUnavailable(job.id, "cancellation is in progress");
 			addJobLog(job, "abort requested");
 			if (promptAccepted) void client?.abort().catch(() => {});
-			terminateTimer = setTimeout(() => {
-				if (child?.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
-			}, 1_000);
-			killTimer = setTimeout(() => {
-				if (child?.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-			}, 6_000);
+			terminateTimer = setTimeout(terminateChild, 1_000);
+			killTimer = setTimeout(killChild, 6_000);
 			terminateTimer.unref();
 			killTimer.unref();
 		};
@@ -575,46 +601,78 @@ async function runRpcAgent(
 		unsubscribeRpc?.();
 		client?.dispose();
 		if (child && child.exitCode === null && child.signalCode === null) {
-			child.kill("SIGTERM");
-			setTimeout(() => child?.kill("SIGKILL"), 5_000).unref();
+			terminateChild();
+			const finalKillTimer = setTimeout(killChild, 5_000);
+			finalKillTimer.unref();
+			child.once("close", () => clearTimeout(finalKillTimer));
 		}
 		if (tempDir) await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+	}
+	const fullOutput = getFinalAssistantOutput(result.messages) || result.errorMessage || result.stderr || result.output;
+	if (job.outputMode === "file-only") {
+		try {
+			result.artifact = await writeOutputArtifact(fullOutput, { maxBytes: job.limits.outputMaxBytes, maxLines: job.limits.outputMaxLines }, undefined, { maxArtifacts: job.limits.journalRetention, maxAgeMs: job.limits.journalMaxAgeMs });
+			result.output = formatOutputArtifactReceipt(result.artifact);
+		} catch (error) {
+			result.status = "failed";
+			result.exitCode = 1;
+			result.stopReason = "error";
+			result.errorMessage = error instanceof Error ? error.message : String(error);
+			result.output = result.errorMessage;
+		}
 	}
 	job.status = result.status;
 	job.exitCode = result.exitCode;
 	job.output = result.output;
 	job.model = result.model;
 	job.stopReason = result.stopReason;
-	job.errorMessage = result.errorMessage;
+	job.errorMessage = result.artifact ? undefined : result.errorMessage;
 	job.finishedAt = Date.now();
 	job.updatedAt = job.finishedAt;
 	job.abort = undefined;
-	const fullOutput = getFinalAssistantOutput(result.messages) || result.errorMessage || result.stderr || result.output;
-	const stored = jobStore.setOutput(job.id, fullOutput, job.limits.outputMaxBytes);
+	const storedOutput = job.outputMode === "file-only" ? result.output : fullOutput;
+	const stored = jobStore.setOutput(job.id, storedOutput, job.limits.outputMaxBytes);
 	jobStore.update(job.id, {
 		delivery: {
 			...stored.delivery,
 			originalOutputBytes: Buffer.byteLength(fullOutput, "utf8"),
 			deliveredOutputBytes: Buffer.byteLength(result.output, "utf8"),
-			outputTruncated: Buffer.byteLength(fullOutput, "utf8") > Buffer.byteLength(result.output, "utf8"),
+			outputTruncated: result.artifact?.truncated ?? Buffer.byteLength(fullOutput, "utf8") > Buffer.byteLength(result.output, "utf8"),
+			...(result.artifact ? { outputArtifact: result.artifact } : {}),
 		},
 	});
 	addJobLog(job, `${job.status} exit=${job.exitCode}`);
+	job.journal.stop();
+	await job.journal.flush();
 	pruneCompletedJobs(job.limits.completedJobRetention);
 	return result;
 }
 
-function mutationLockFailure(job: SubagentJob, agent: AgentConfig, lockedCwd: string, ownerId: string): RunResult {
-	const output = `Cannot start mutation-capable subagent in ${lockedCwd}: ${ownerId} already owns that working directory.`;
+async function mutationLockFailure(job: SubagentJob, agent: AgentConfig, lockedCwd: string, ownerId: string): Promise<RunResult> {
+	const fullOutput = `Cannot start mutation-capable subagent in ${lockedCwd}: ${ownerId} already owns that working directory.`;
 	const finishedAt = Date.now();
 	job.status = "failed";
 	job.exitCode = 1;
+	let output = fullOutput;
+	let artifact: OutputArtifact | undefined;
+	if (job.outputMode === "file-only") {
+		try {
+			artifact = await writeOutputArtifact(fullOutput, { maxBytes: job.limits.outputMaxBytes, maxLines: job.limits.outputMaxLines }, undefined, { maxArtifacts: job.limits.journalRetention, maxAgeMs: job.limits.journalMaxAgeMs });
+			output = formatOutputArtifactReceipt(artifact);
+		} catch (error) {
+			output = error instanceof Error ? error.message : String(error);
+		}
+	}
 	job.output = output;
-	job.errorMessage = output;
+	job.errorMessage = artifact ? undefined : job.outputMode === "inline" ? fullOutput : output;
 	job.finishedAt = finishedAt;
 	job.updatedAt = finishedAt;
-	jobStore.setOutput(job.id, output, job.limits.outputMaxBytes);
-	addJobLog(job, output);
+	const stored = jobStore.setOutput(job.id, artifact ? output : fullOutput, job.limits.outputMaxBytes);
+	if (artifact) jobStore.update(job.id, { delivery: { ...stored.delivery, deliveredOutputBytes: Buffer.byteLength(output, "utf8"), outputTruncated: artifact.truncated, outputArtifact: artifact } });
+	addJobLog(job, job.outputMode === "file-only" ? "mutation lock prevented run; report persisted" : fullOutput);
+	job.abort = undefined;
+	job.journal.stop();
+	await job.journal.flush();
 	pruneCompletedJobs(job.limits.completedJobRetention);
 	return {
 		id: job.id,
@@ -627,7 +685,9 @@ function mutationLockFailure(job: SubagentJob, agent: AgentConfig, lockedCwd: st
 		output,
 		stderr: "",
 		messages: [],
-		errorMessage: output,
+		errorMessage: job.errorMessage,
+		outputMode: job.outputMode,
+		...(artifact ? { artifact } : {}),
 	};
 }
 
@@ -643,7 +703,7 @@ function runManagedAgent(
 	const runCwd = resolve(taskCwd ?? cwd);
 	if (!isMutationCapable(agent.tools)) return runRpcAgent(cwd, agent, job, taskCwd, model, extensionPaths, signal);
 	const ownerId = mutationLocks.acquire(runCwd, job.id);
-	if (ownerId) return Promise.resolve(mutationLockFailure(job, agent, runCwd, ownerId));
+	if (ownerId) return mutationLockFailure(job, agent, runCwd, ownerId);
 	return runRpcAgent(cwd, agent, job, taskCwd, model, extensionPaths, signal).finally(() => mutationLocks.release(runCwd, job.id));
 }
 
@@ -660,7 +720,9 @@ function resultDetails(result: RunResult) {
 		exitCode: result.exitCode,
 		...(result.model === undefined ? {} : { model: result.model }),
 		...(result.stopReason === undefined ? {} : { stopReason: result.stopReason }),
-		...(result.errorMessage === undefined ? {} : { errorMessage: result.errorMessage }),
+		...(result.errorMessage === undefined || (result.outputMode === "file-only" && result.artifact) ? {} : { errorMessage: result.errorMessage }),
+		outputMode: result.outputMode,
+		...(result.artifact === undefined ? {} : { artifact: result.artifact }),
 	};
 }
 
@@ -681,13 +743,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		const results = resultDelivery.take(ids);
 		if (results.length === 0) return;
 		const successfulBatch = results.length > 1 && results.every((result) => !isFailure(result));
+		const unboundedContent = successfulBatch
+			? `Subagents completed (${results.length}).\n\n${results.map((result) => `## ${result.id} ${result.name}\n\n${result.output}`).join("\n\n---\n\n")}`
+			: `Subagent ${results[0].id} (${results[0].name}) ${results[0].status}.\n\n${results[0].output}`;
+		const content = truncateBoundedOutput(unboundedContent, { maxBytes: 50_000, maxLines: 2_000 }).text;
 		pi.sendMessage({
 			customType: "subagent-result",
-			content: successfulBatch
-				? `Subagents completed (${results.length}).\n\n${results.map((result) => `## ${result.id} ${result.name}\n\n${result.output}`).join("\n\n---\n\n")}`
-				: `Subagent ${results[0].id} (${results[0].name}) ${results[0].status}.\n\n${results[0].output}`,
+			content,
 			display: true,
-			details: { results: results.map((result) => ({ id: result.id, status: result.status })) },
+			details: { results: results.map(resultDetails), aggregateTruncated: content !== unboundedContent },
 		}, { deliverAs: "followUp", triggerTurn: true });
 	};
 	const completionBatcher = new CompletionBatcher(250, deliverResults);
@@ -724,7 +788,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			}
 		}
 		const limits = loadSubagentLimits(ctx.cwd);
-		const prepared = prepareTask(ctx, agents, params as TaskRequest, undefined, undefined, limits);
+		const prepared = prepareTask(ctx, agents, params as TaskRequest, undefined, undefined, params.outputMode, limits);
 		assertCapacity(limits, 1);
 		const job = createJob(prepared.agent.name, prepared.request.task, prepared.cwd, prepared.request.name, {
 			parentSessionId: ctx.sessionManager.getSessionId(),
@@ -732,6 +796,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			model: prepared.model,
 			limits,
 			timeoutMs: prepared.timeoutMs,
+			outputMode: prepared.outputMode,
 			delivery: { mode: "background", method: "deferred-follow-up", consumedByWait: false },
 		});
 		// Background jobs outlive the parent tool turn; explicit subagent_cancel owns their cancellation.
@@ -981,6 +1046,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					model: prepared.model,
 					limits,
 					timeoutMs: prepared.timeoutMs,
+					outputMode: prepared.outputMode,
 					delivery: { mode: deliveryMode, method: "tool-result", consumedByWait: false },
 				});
 				job.completion = runManagedAgent(ctx.cwd, prepared.agent, job, prepared.cwd, prepared.model, prepared.extensionPaths, signal);
@@ -990,7 +1056,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			if (hasSingle) {
 				let prepared: PreparedTask;
 				try {
-					prepared = prepareTask(ctx, agents, { agent: params.agent!, task: params.task!, cwd: params.cwd, name: params.name, model: params.model, timeoutMs: params.timeoutMs }, params.model, params.timeoutMs, limits);
+					prepared = prepareTask(ctx, agents, { agent: params.agent!, task: params.task!, cwd: params.cwd, name: params.name, model: params.model, timeoutMs: params.timeoutMs, outputMode: params.outputMode }, params.model, params.timeoutMs, params.outputMode, limits);
 					assertCapacity(limits, 1);
 				} catch (error) {
 					return { content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], details: { mode: "single" }, isError: true };
@@ -1010,7 +1076,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			const tasks = params.tasks ?? [];
 			let preparedTasks: PreparedTask[];
 			try {
-				preparedTasks = tasks.map((task) => prepareTask(ctx, agents, task, params.model, params.timeoutMs, limits));
+				preparedTasks = tasks.map((task) => prepareTask(ctx, agents, task, params.model, params.timeoutMs, params.outputMode, limits));
 				assertCapacity(limits, preparedTasks.length);
 			} catch (error) {
 				return { content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], details: { mode: "parallel", results: [] }, isError: true };

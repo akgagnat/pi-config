@@ -134,8 +134,48 @@ test("RPC client treats malformed protocol records as fatal", async () => {
 
 test("RPC client terminates an oversized unterminated frame", () => {
 	const child = fakeChild();
-	const client = new RpcProcessClient(child, { maxFrameBytes: 8 });
+	const client = new RpcProcessClient(child, { maxFrameBytes: 8, absoluteMaxFrameBytes: 8 });
 	child.stdout.write("123456789");
+	assert.deepEqual(child.killSignals, ["SIGTERM"]);
+	client.dispose();
+});
+
+test("RPC client accepts a fragmented known oversized aggregate within the absolute bound", () => {
+	const child = fakeChild();
+	const client = new RpcProcessClient(child, { maxFrameBytes: 80, absoluteMaxFrameBytes: 2_000 });
+	const events: any[] = [];
+	client.onEvent((event) => events.push(event));
+	const record = JSON.stringify({ type: "message_end", attackerPayload: "secret".repeat(100), message: { role: "assistant", content: [{ type: "text", text: "x".repeat(500) }], extra: "secret".repeat(100) } });
+	child.stdout.write(record.slice(0, 100));
+	assert.deepEqual(events, []);
+	child.stdout.write(`${record.slice(100)}\n`);
+	const event = events[0] as any;
+	assert.equal(event.type, "message_end");
+	assert.equal("attackerPayload" in event, false);
+	assert.equal("extra" in event.message, false);
+	assert.ok(Buffer.byteLength(JSON.stringify(event), "utf8") < 1_000);
+	assert.deepEqual(child.killSignals, []);
+	client.dispose();
+});
+
+test("RPC client rejects oversized unknown records and ignores trailing frames after one fatal error", () => {
+	const child = fakeChild();
+	const client = new RpcProcessClient(child, { maxFrameBytes: 80, absoluteMaxFrameBytes: 2_000 });
+	const events: string[] = [];
+	client.onEvent((event) => events.push(event.type));
+	child.stdout.write(`${JSON.stringify({ type: "unknown", payload: "x".repeat(200) })}\n{\"type\":\"agent_settled\"}\n`);
+	assert.deepEqual(events, ["transport_error"]);
+	assert.deepEqual(child.killSignals, ["SIGTERM"]);
+	client.dispose();
+});
+
+test("RPC client rejects an EOF partial frame instead of parsing it", async () => {
+	const child = fakeChild();
+	const client = new RpcProcessClient(child);
+	const pending = client.getState();
+	child.stdout.write('{"type":"response"');
+	child.stdout.end();
+	await assert.rejects(pending, /unterminated frame/);
 	assert.deepEqual(child.killSignals, ["SIGTERM"]);
 	client.dispose();
 });
