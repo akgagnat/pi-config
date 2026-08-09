@@ -36,6 +36,8 @@ import { RunJournal } from "./journal.ts";
 import { SteeringRegistry } from "./steering.ts";
 import { EscalationIngress, EscalationRegistry } from "./escalation.ts";
 import { childExtensionArgs, resolveChildExtensions } from "./child-extensions.ts";
+import { ActiveJobWidget } from "./active-widget.ts";
+import { CompletionBatcher } from "./completion-batcher.ts";
 
 const DEFAULT_TOOLS = ["read", "grep", "find", "ls"];
 
@@ -665,6 +667,7 @@ function resultDetails(result: RunResult) {
 export default function subagentsExtension(pi: ExtensionAPI) {
 	if (process.env.PI_SUBAGENT === "1") return;
 	const resultDelivery = new ResultDelivery<RunResult>();
+	const activeWidget = new ActiveJobWidget(jobStore);
 	let sessionContext: ExtensionContext | undefined;
 	const updateStatus = () => {
 		const values = [...jobs.values()];
@@ -674,27 +677,37 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			failed: values.filter((job) => job.status === "failed" || job.status === "aborted").length,
 		}));
 	};
-	const flushResults = () => {
-		for (const result of resultDelivery.drain()) {
-			pi.sendMessage({
-				customType: "subagent-result",
-				content: `Subagent ${result.id} (${result.name}) ${result.status}.\n\n${result.output}`,
-				display: true,
-				details: { id: result.id, status: result.status },
-			}, { deliverAs: "followUp", triggerTurn: true });
-		}
+	const deliverResults = (ids: string[]) => {
+		const results = resultDelivery.take(ids);
+		if (results.length === 0) return;
+		const successfulBatch = results.length > 1 && results.every((result) => !isFailure(result));
+		pi.sendMessage({
+			customType: "subagent-result",
+			content: successfulBatch
+				? `Subagents completed (${results.length}).\n\n${results.map((result) => `## ${result.id} ${result.name}\n\n${result.output}`).join("\n\n---\n\n")}`
+				: `Subagent ${results[0].id} (${results[0].name}) ${results[0].status}.\n\n${results[0].output}`,
+			display: true,
+			details: { results: results.map((result) => ({ id: result.id, status: result.status })) },
+		}, { deliverAs: "followUp", triggerTurn: true });
 	};
-	pi.on("session_start", (_event, ctx) => { sessionContext = ctx; updateStatus(); });
-	pi.on("agent_end", () => { flushResults(); });
-	pi.on("session_shutdown", () => {
+	const completionBatcher = new CompletionBatcher(250, deliverResults);
+	pi.on("session_start", (_event, ctx) => { sessionContext = ctx; activeWidget.start(ctx); updateStatus(); });
+	pi.on("session_shutdown", async () => {
 		escalation.clear("parent session shut down");
+		completionBatcher.clear();
+		activeWidget.stop();
+		const completions: Promise<RunResult>[] = [];
 		for (const job of jobs.values()) {
-			if (job.status === "initializing" || job.status === "working") deliverySuppressed.add(job.id);
+			if (job.status === "initializing" || job.status === "working") {
+				deliverySuppressed.add(job.id);
+				if (job.completion) completions.push(job.completion);
+			}
 			job.abort?.();
 		}
 		sessionContext?.ui.setStatus("subagents", undefined);
 		sessionContext = undefined;
 		resultDelivery.clear();
+		await Promise.allSettled(completions);
 	});
 
 	const startBackground = async (toolCallId: string, params: SubagentParams, ctx: ExtensionContext) => {
@@ -728,7 +741,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			updateStatus();
 			if (deliverySuppressed.has(result.id)) return;
 			resultDelivery.defer(result);
-			if (sessionContext?.isIdle()) flushResults();
+			if (isFailure(result)) completionBatcher.failure(result.id);
+			else completionBatcher.success(result.id);
 		}, (error) => {
 			addJobLog(job, `completion failed: ${error instanceof Error ? error.message : String(error)}`);
 		});
@@ -813,11 +827,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				return job;
 			});
 			if (signal?.aborted) throw new Error("Wait aborted. Subagents keep running.");
-			resultDelivery.consume(params.ids);
-			for (const job of selected) {
-				const snapshot = jobStore.get(job.id);
-				if (snapshot) jobStore.update(job.id, { delivery: { ...snapshot.delivery, method: "subagent-wait", consumedByWait: true } });
-			}
+			resultDelivery.assertNotDelivered(params.ids);
+			completionBatcher.reserve(params.ids);
 			onUpdate?.({ content: [{ type: "text", text: `Waiting for ${params.ids.join(", ")}...` }], details: { ids: params.ids } });
 			const completion = Promise.all(selected.map((job) => job.completion!));
 			let abortWait: (() => void) | undefined;
@@ -828,8 +839,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			let results: RunResult[];
 			try {
 				results = aborted ? await Promise.race([completion, aborted]) : await completion;
+			} catch (error) {
+				completionBatcher.release(params.ids);
+				throw error;
 			} finally {
 				if (signal && abortWait) signal.removeEventListener("abort", abortWait);
+			}
+			completionBatcher.consume(params.ids);
+			resultDelivery.consume(params.ids);
+			for (const job of selected) {
+				const snapshot = jobStore.get(job.id);
+				if (snapshot) jobStore.update(job.id, { delivery: { ...snapshot.delivery, method: "subagent-wait", consumedByWait: true } });
 			}
 			return {
 				content: [{ type: "text", text: results.map((result) => `## ${result.id} ${result.name} — ${result.status}\n\n${result.output}`).join("\n\n---\n\n") }],
@@ -963,7 +983,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					timeoutMs: prepared.timeoutMs,
 					delivery: { mode: deliveryMode, method: "tool-result", consumedByWait: false },
 				});
-				return runManagedAgent(ctx.cwd, prepared.agent, job, prepared.cwd, prepared.model, prepared.extensionPaths, signal);
+				job.completion = runManagedAgent(ctx.cwd, prepared.agent, job, prepared.cwd, prepared.model, prepared.extensionPaths, signal);
+				return job.completion;
 			};
 
 			if (hasSingle) {
