@@ -32,6 +32,7 @@ import { JobStore, type JobDeliveryMetadata, type JobModelMetadata } from "./job
 import { RpcProcessClient, type RpcProcessEvent } from "./rpc.ts";
 import { openSubagentInspector } from "./inspector.ts";
 import { loadSubagentLimits, resolveTimeoutMs, type SubagentLimits } from "./settings.ts";
+import { RunJournal } from "./journal.ts";
 
 const DEFAULT_TOOLS = ["read", "grep", "find", "ls"];
 
@@ -186,6 +187,7 @@ function createJob(
 		delivery: metadata.delivery ?? { mode: "foreground", method: "tool-result", consumedByWait: false },
 		startedAt,
 	});
+	new RunJournal(jobStore, id, metadata.limits).start();
 	job.abort = () => {
 		if (job.status === "done" || job.status === "failed" || job.status === "aborted" || job.abortController.signal.aborted) return;
 		job.updatedAt = Date.now();

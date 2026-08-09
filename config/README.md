@@ -53,5 +53,10 @@ Point Pi at the whole `extensions/` directory.
 | `outputMaxLines` | Final delivered output line cap | 1–10,000 |
 | `logMaxChars` | Per-job stderr/activity retention cap | 1,024–1,000,000 characters |
 | `completedJobRetention` | Completed in-memory jobs to retain | 1–100 |
+| `journalMaxEvents` | Telemetry records retained in each journal | 1–2,000 |
+| `journalRetention` | Completed journals retained | 1–1,000 |
+| `journalMaxAgeMs` | Maximum journal age | 60,000–31,536,000,000 ms |
+
+Completed runs are also written best-effort to `~/.pi/agent/subagent-journals/<uuid>/`. Each private (`0700`) directory contains versioned `status.json`, bounded `events.jsonl`, `output.txt`, and `stderr.txt` files (`0600`). The journal is a post-mortem projection only: it is not a queue, does not resume a child, and children still terminate when their parent session shuts down. Artifact writes and cleanup never block or fail a live child; malformed or partial artifacts are ignored by the read-only reader seam for the future inspector.
 
 Unsupported fields or invalid values cause subagent launch to fail with a clear error; they never silently select another value. `timeoutMs` may also be supplied per `subagent` or `subagent_spawn` call and uses the same 1,000–7,200,000 ms bounds.

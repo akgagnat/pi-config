@@ -8,6 +8,9 @@
     "outputMaxBytes": 20000,
     "outputMaxLines": 600,
     "logMaxChars": 40000,
-    "completedJobRetention": 20
+    "completedJobRetention": 20,
+    "journalMaxEvents": 500,
+    "journalRetention": 100,
+    "journalMaxAgeMs": 2592000000
   }
 }

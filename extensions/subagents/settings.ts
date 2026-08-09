@@ -7,6 +7,9 @@ export type SubagentLimits = {
 	outputMaxLines: number;
 	logMaxChars: number;
 	completedJobRetention: number;
+	journalMaxEvents: number;
+	journalRetention: number;
+	journalMaxAgeMs: number;
 };
 
 export const DEFAULT_SUBAGENT_LIMITS: Readonly<SubagentLimits> = {
@@ -16,6 +19,9 @@ export const DEFAULT_SUBAGENT_LIMITS: Readonly<SubagentLimits> = {
 	outputMaxLines: 600,
 	logMaxChars: 40_000,
 	completedJobRetention: 20,
+	journalMaxEvents: 500,
+	journalRetention: 100,
+	journalMaxAgeMs: 30 * 24 * 60 * 60_000,
 };
 
 const SETTING_BOUNDS = {
@@ -25,6 +31,9 @@ const SETTING_BOUNDS = {
 	outputMaxLines: { min: 1, max: 10_000 },
 	logMaxChars: { min: 1_024, max: 1_000_000 },
 	completedJobRetention: { min: 1, max: 100 },
+	journalMaxEvents: { min: 1, max: 2_000 },
+	journalRetention: { min: 1, max: 1_000 },
+	journalMaxAgeMs: { min: 60_000, max: 365 * 24 * 60 * 60_000 },
 } as const;
 
 type SubagentSettingName = keyof SubagentLimits;
