@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { formatActivityStatus } from "../extensions/subagents/status.ts";
 import { isTrustedChildCwd } from "../extensions/subagents/policy.ts";
 import { CwdMutationLock, isMutationCapable } from "../extensions/subagents/mutation-lock.ts";
+import { DEFAULT_SUBAGENT_LIMITS, parseSubagentLimits, resolveTimeoutMs } from "../extensions/subagents/settings.ts";
 import { truncateOutput } from "../extensions/subagents/output.ts";
 import { ResultDelivery } from "../extensions/subagents/result-delivery.ts";
 import { JobManager, toJobSnapshot } from "../extensions/subagents/jobs.ts";
@@ -34,6 +35,21 @@ test("mutation-capable profiles are exclusive per normalized working directory",
 	assert.equal(locks.acquire("/work/project", "sa-3"), "sa-1");
 	locks.release("/work/project", "sa-1");
 	assert.equal(locks.acquire("/work/project", "sa-3"), undefined);
+});
+
+test("subagent limits use safe defaults and reject unsupported or unsafe settings", () => {
+	assert.deepEqual(parseSubagentLimits(undefined), DEFAULT_SUBAGENT_LIMITS);
+	assert.deepEqual(parseSubagentLimits({ maxConcurrent: 2, defaultTimeoutMs: 60_000, outputMaxBytes: 30_000 }), {
+		...DEFAULT_SUBAGENT_LIMITS,
+		maxConcurrent: 2,
+		defaultTimeoutMs: 60_000,
+		outputMaxBytes: 30_000,
+	});
+	assert.throws(() => parseSubagentLimits({ maxConcurrent: 0 }), /between 1 and 16/);
+	assert.throws(() => parseSubagentLimits({ unexpected: true }), /not supported/);
+	assert.equal(resolveTimeoutMs(undefined, { ...DEFAULT_SUBAGENT_LIMITS, defaultTimeoutMs: 60_000 }), 60_000);
+	assert.equal(resolveTimeoutMs(2_000, DEFAULT_SUBAGENT_LIMITS), 2_000);
+	assert.throws(() => resolveTimeoutMs(999, DEFAULT_SUBAGENT_LIMITS), /Invalid timeoutMs/);
 });
 
 test("output truncation respects UTF-8 byte and line limits", () => {
@@ -72,7 +88,7 @@ test("subagent job details remain structured-cloneable while work is running", (
 	assert.deepEqual(Object.keys(details).sort(), ["agent", "cwd", "id", "name", "startedAt", "status", "updatedAt"]);
 });
 
-test("an unavailable profile does not leave an initializing background job", async () => {
+test("rejected subagent requests do not create jobs", async () => {
 	const tools = new Map<string, any>();
 	subagentsExtension({
 		on() {},
@@ -92,6 +108,10 @@ test("an unavailable profile does not leave an initializing background job", asy
 		tools.get("subagent_spawn").execute("call", { agent: "general", task: "do work" }, undefined, undefined, ctx),
 		/Unknown agent/,
 	);
+	const foreground = await tools.get("subagent").execute("call", { agent: "general", task: "do work" }, undefined, undefined, ctx);
+	assert.equal(foreground.isError, true);
+	const batch = await tools.get("subagent").execute("call", { tasks: [{ agent: "general", task: "do work" }] }, undefined, undefined, ctx);
+	assert.equal(batch.isError, true);
 	const listing = await tools.get("subagent_list").execute();
 	assert.match(listing.content[0].text, /No subagent jobs yet/);
 	assert.doesNotThrow(() => structuredClone(listing.details));
@@ -121,7 +141,7 @@ test("subagents opens the read-only live inspector", async () => {
 		undefined,
 		baseCtx,
 	);
-	const id = result.details.result.id;
+	assert.equal(result.isError, true);
 	let customCalls = 0;
 	await commands.get("subagents").handler("", {
 		...baseCtx,
@@ -136,7 +156,6 @@ test("subagents opens the read-only live inspector", async () => {
 	assert.equal(commands.has("subagents-status"), false);
 	assert.equal(commands.has("subagent-log"), false);
 	assert.equal(customCalls, 1);
-	assert.match(id, /^sa-/);
 });
 
 test("job manager lets callers inspect work before collecting its result", async () => {

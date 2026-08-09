@@ -187,7 +187,7 @@ export class JobStore {
 	private readonly maxTimelineEvents: number;
 	private readonly maxStderrBytes: number;
 	private readonly maxOutputBytes: number;
-	private readonly maxCompletedJobs: number;
+	private maxCompletedJobs: number;
 	private readonly now: () => number;
 
 	constructor(options: JobStoreOptions = {}) {
@@ -282,19 +282,21 @@ export class JobStore {
 		return this.touch(job);
 	}
 
-	appendStderr(id: string, chunk: string): JobSnapshot {
+	appendStderr(id: string, chunk: string, maxBytes = this.maxStderrBytes): JobSnapshot {
+		assertLimit("maxBytes", maxBytes);
 		const job = this.requireJob(id);
 		job.stderr.totalBytes += Buffer.byteLength(chunk, "utf8");
-		job.stderr.text = byteSuffix(job.stderr.text + chunk, this.maxStderrBytes);
+		job.stderr.text = byteSuffix(job.stderr.text + chunk, maxBytes);
 		job.stderr.truncated = job.stderr.totalBytes > Buffer.byteLength(job.stderr.text, "utf8");
 		return this.touch(job);
 	}
 
 	/** Replace the final report, retaining its beginning while recording its full byte size. */
-	setOutput(id: string, output: string): JobSnapshot {
+	setOutput(id: string, output: string, maxBytes = this.maxOutputBytes): JobSnapshot {
+		assertLimit("maxBytes", maxBytes);
 		const job = this.requireJob(id);
 		job.output.totalBytes = Buffer.byteLength(output, "utf8");
-		job.output.text = bytePrefix(output, this.maxOutputBytes);
+		job.output.text = bytePrefix(output, maxBytes);
 		const retainedBytes = Buffer.byteLength(job.output.text, "utf8");
 		job.output.truncated = job.output.totalBytes > retainedBytes;
 		job.delivery = {
@@ -304,6 +306,12 @@ export class JobStore {
 			outputTruncated: job.output.truncated,
 		};
 		return this.touch(job);
+	}
+
+	setCompletedJobRetention(maxCompletedJobs: number): void {
+		assertLimit("maxCompletedJobs", maxCompletedJobs);
+		this.maxCompletedJobs = maxCompletedJobs;
+		this.evictCompletedJobs();
 	}
 
 	subscribe(listener: JobStoreListener): () => void {

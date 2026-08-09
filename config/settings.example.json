@@ -1,5 +1,13 @@
 {
   "extensions": [
     "/path/to/pi-config/extensions"
-  ]
+  ],
+  "subagents": {
+    "maxConcurrent": 4,
+    "defaultTimeoutMs": 900000,
+    "outputMaxBytes": 20000,
+    "outputMaxLines": 600,
+    "logMaxChars": 40000,
+    "completedJobRetention": 20
+  }
 }

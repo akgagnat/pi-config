@@ -31,13 +31,9 @@ import { type JobStatus, toJobSnapshot } from "./jobs.ts";
 import { JobStore, type JobDeliveryMetadata, type JobModelMetadata } from "./job-store.ts";
 import { RpcProcessClient, type RpcProcessEvent } from "./rpc.ts";
 import { openSubagentInspector } from "./inspector.ts";
+import { loadSubagentLimits, resolveTimeoutMs, type SubagentLimits } from "./settings.ts";
 
-const MAX_PARALLEL_TASKS = 4;
 const DEFAULT_TOOLS = ["read", "grep", "find", "ls"];
-const OUTPUT_CAP_BYTES = 20_000;
-const OUTPUT_CAP_LINES = 600;
-const LOG_CAP_CHARS = 40_000;
-const JOB_TIMEOUT_MS = 15 * 60_000;
 
 type AgentConfig = AgentProfile;
 type SubagentJob = {
@@ -60,6 +56,8 @@ type SubagentJob = {
 	completion?: Promise<RunResult>;
 	abortController: AbortController;
 	abort?: () => void;
+	limits: SubagentLimits;
+	timeoutMs: number;
 };
 
 type RunResult = {
@@ -84,6 +82,7 @@ const TaskSchema = Type.Object({
 	name: Type.Optional(Type.String({ description: "Human-readable name for this subagent job" })),
 	cwd: Type.Optional(Type.String({ description: "Working directory for this subagent" })),
 	model: Type.Optional(Type.String({ description: "Model to use for this subagent job. Defaults to the main agent model." })),
+	timeoutMs: Type.Optional(Type.Integer({ description: "Maximum runtime in milliseconds. Defaults to subagents.defaultTimeoutMs." })),
 });
 
 const SubagentParamsSchema = Type.Object({
@@ -91,6 +90,7 @@ const SubagentParamsSchema = Type.Object({
 	task: Type.Optional(Type.String({ description: "Task for single-task mode" })),
 	name: Type.Optional(Type.String({ description: "Human-readable name for the single subagent job" })),
 	model: Type.Optional(Type.String({ description: "Model to use for the subagent. Defaults to the main agent model." })),
+	timeoutMs: Type.Optional(Type.Integer({ description: "Maximum runtime in milliseconds. Defaults to subagents.defaultTimeoutMs." })),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the subagent." })),
 	tasks: Type.Optional(Type.Array(TaskSchema, { description: "Small parallel batch of delegated tasks" })),
 	scope: Type.Optional(
@@ -121,9 +121,10 @@ function makeJobId(): string {
 
 function addJobLog(job: SubagentJob, line: string): void {
 	const at = Date.now();
-	job.logs.push(`[${nowIso()}] ${line}`);
+	const maxLineChars = Math.max(1, job.limits.logMaxChars - 12);
+	job.logs.push(`[${nowIso()}] ${truncateMiddle(line, maxLineChars)}`);
 	let combined = job.logs.join("\n");
-	while (combined.length > LOG_CAP_CHARS && job.logs.length > 1) {
+	while (combined.length > job.limits.logMaxChars && job.logs.length > 1) {
 		job.logs.shift();
 		combined = job.logs.join("\n");
 	}
@@ -144,13 +145,15 @@ function createJob(
 	agent: string,
 	task: string,
 	cwd: string,
-	requestedName?: string,
+	requestedName: string | undefined,
 	metadata: {
 		parentSessionId?: string;
 		toolCallId?: string;
 		model?: JobModelMetadata;
+		limits: SubagentLimits;
+		timeoutMs: number;
 		delivery?: JobDeliveryMetadata;
-	} = {},
+	},
 ): SubagentJob {
 	const id = makeJobId();
 	const taskPreview = task.replace(/\s+/g, " ").trim().slice(0, 48);
@@ -168,7 +171,10 @@ function createJob(
 		stderr: "",
 		logs: [],
 		abortController: new AbortController(),
+		limits: metadata.limits,
+		timeoutMs: metadata.timeoutMs,
 	};
+	jobStore.setCompletedJobRetention(metadata.limits.completedJobRetention);
 	jobStore.create({
 		id,
 		name,
@@ -210,11 +216,11 @@ function recentJobs(): SubagentJob[] {
 		.slice(0, 20);
 }
 
-function pruneCompletedJobs(): void {
+function pruneCompletedJobs(completedJobRetention: number): void {
 	const completed = [...jobs.values()]
 		.filter((job) => job.status === "done" || job.status === "failed" || job.status === "aborted")
 		.sort((a, b) => (b.finishedAt ?? b.updatedAt) - (a.finishedAt ?? a.updatedAt));
-	for (const job of completed.slice(20)) {
+	for (const job of completed.slice(completedJobRetention)) {
 		jobs.delete(job.id);
 		deliverySuppressed.delete(job.id);
 	}
@@ -262,6 +268,61 @@ function resolveJobModel(
 		if (requested) return { requested, source };
 	}
 	return { source: "default" };
+}
+
+type TaskRequest = {
+	agent: string;
+	task: string;
+	cwd?: string;
+	name?: string;
+	model?: string;
+	timeoutMs?: number;
+};
+
+type PreparedTask = {
+	request: TaskRequest;
+	agent: AgentConfig;
+	cwd: string;
+	model: JobModelMetadata;
+	limits: SubagentLimits;
+	timeoutMs: number;
+};
+
+function activeJobCount(): number {
+	return [...jobs.values()].filter((job) => job.status === "initializing" || job.status === "working").length;
+}
+
+function assertCapacity(limits: SubagentLimits, requestedJobs: number): void {
+	const active = activeJobCount();
+	if (active + requestedJobs > limits.maxConcurrent) {
+		throw new Error(`Too many running subagents. Max is ${limits.maxConcurrent}; ${active} already running.`);
+	}
+}
+
+function prepareTask(
+	ctx: ExtensionContext,
+	agents: AgentConfig[],
+	request: TaskRequest,
+	requestModel: string | undefined,
+	requestTimeoutMs: number | undefined,
+	limits: SubagentLimits,
+): PreparedTask {
+	const cwdResult = validateCwd(ctx.cwd, request.cwd);
+	if (cwdResult.error) throw new Error(cwdResult.error);
+	if (!isTrustedChildCwd(ctx.cwd, cwdResult.cwd)) {
+		throw new Error("cwd must be the trusted project directory or one of its descendants.");
+	}
+	const agent = agents.find((candidate) => candidate.name === request.agent);
+	if (!agent) throw new Error(`Unknown agent. Available: ${agents.map((candidate) => candidate.name).join(", ") || "none"}`);
+	const inheritedModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+	return {
+		request,
+		agent,
+		cwd: cwdResult.cwd,
+		model: resolveJobModel(request.model, requestModel, agent.model, inheritedModel),
+		limits,
+		timeoutMs: resolveTimeoutMs(request.timeoutMs ?? requestTimeoutMs, limits),
+	};
 }
 
 function logJsonEvent(job: SubagentJob, event: any): void {
@@ -403,9 +464,9 @@ async function runRpcAgent(
 		});
 		client = new RpcProcessClient(child as ChildProcessWithoutNullStreams, {
 			onStderr: (text) => {
-				result.stderr = (result.stderr + text).slice(-LOG_CAP_CHARS);
-				job.stderr = (job.stderr + text).slice(-LOG_CAP_CHARS);
-				jobStore.appendStderr(job.id, text);
+				result.stderr = (result.stderr + text).slice(-job.limits.logMaxChars);
+				job.stderr = (job.stderr + text).slice(-job.limits.logMaxChars);
+				jobStore.appendStderr(job.id, text, job.limits.logMaxChars);
 			},
 		});
 		const refreshStats = () => {
@@ -449,7 +510,7 @@ async function runRpcAgent(
 		if (abortSignal.aborted) abortHandler();
 		else abortSignal.addEventListener("abort", abortHandler, { once: true });
 		if (abortRequested) throw new Error("Subagent was aborted before prompting.");
-		const settled = client.waitForSettled(JOB_TIMEOUT_MS);
+		const settled = client.waitForSettled(job.timeoutMs);
 		void settled.catch(() => {});
 		await client.prompt(`Task: ${job.task}`);
 		promptAccepted = true;
@@ -461,7 +522,7 @@ async function runRpcAgent(
 			if (stats.contextUsage) jobStore.appendTimeline(job.id, { type: "context", ...stats.contextUsage, contextQuality: stats.contextUsage.tokens === null ? "unknown" : "estimated", at: Date.now() });
 		}
 		result.exitCode = 0;
-		result.output = truncateBoundedOutput(getFinalAssistantOutput(result.messages) || result.errorMessage || result.stderr || "(no output)", { maxBytes: OUTPUT_CAP_BYTES, maxLines: OUTPUT_CAP_LINES }).text;
+		result.output = truncateBoundedOutput(getFinalAssistantOutput(result.messages) || result.errorMessage || result.stderr || "(no output)", { maxBytes: job.limits.outputMaxBytes, maxLines: job.limits.outputMaxLines }).text;
 		if (wasAborted) result.stopReason = "aborted";
 		result.status = wasAborted ? "aborted" : result.stopReason === "error" ? "failed" : "done";
 	} catch (error) {
@@ -493,7 +554,7 @@ async function runRpcAgent(
 	job.updatedAt = job.finishedAt;
 	job.abort = undefined;
 	const fullOutput = getFinalAssistantOutput(result.messages) || result.errorMessage || result.stderr || result.output;
-	const stored = jobStore.setOutput(job.id, fullOutput);
+	const stored = jobStore.setOutput(job.id, fullOutput, job.limits.outputMaxBytes);
 	jobStore.update(job.id, {
 		delivery: {
 			...stored.delivery,
@@ -503,7 +564,7 @@ async function runRpcAgent(
 		},
 	});
 	addJobLog(job, `${job.status} exit=${job.exitCode}`);
-	pruneCompletedJobs();
+	pruneCompletedJobs(job.limits.completedJobRetention);
 	return result;
 }
 
@@ -516,9 +577,9 @@ function mutationLockFailure(job: SubagentJob, agent: AgentConfig, lockedCwd: st
 	job.errorMessage = output;
 	job.finishedAt = finishedAt;
 	job.updatedAt = finishedAt;
-	jobStore.setOutput(job.id, output);
+	jobStore.setOutput(job.id, output, job.limits.outputMaxBytes);
 	addJobLog(job, output);
-	pruneCompletedJobs();
+	pruneCompletedJobs(job.limits.completedJobRetention);
 	return {
 		id: job.id,
 		name: job.name,
@@ -613,23 +674,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				throw new Error("Canceled.");
 			}
 		}
-		const cwdResult = validateCwd(ctx.cwd, params.cwd);
-		if (cwdResult.error) throw new Error(cwdResult.error);
-		if (!isTrustedChildCwd(ctx.cwd, cwdResult.cwd)) throw new Error("cwd must be the trusted project directory or one of its descendants.");
-		const agent = agents.find((candidate) => candidate.name === params.agent);
-		if (!agent) throw new Error(`Unknown agent. Available: ${agents.map((candidate) => candidate.name).join(", ") || "none"}`);
-		const inheritedModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-		const model = resolveJobModel(params.model, undefined, agent.model, inheritedModel);
-		const job = createJob(params.agent, params.task, cwdResult.cwd, params.name, {
+		const limits = loadSubagentLimits(ctx.cwd);
+		const prepared = prepareTask(ctx, agents, params as TaskRequest, undefined, undefined, limits);
+		assertCapacity(limits, 1);
+		const job = createJob(prepared.agent.name, prepared.request.task, prepared.cwd, prepared.request.name, {
 			parentSessionId: ctx.sessionManager.getSessionId(),
 			toolCallId,
-			model,
+			model: prepared.model,
+			limits,
+			timeoutMs: prepared.timeoutMs,
 			delivery: { mode: "background", method: "deferred-follow-up", consumedByWait: false },
 		});
 		// Background jobs outlive the parent tool turn; explicit subagent_cancel owns their cancellation.
-		job.completion = runManagedAgent(ctx.cwd, agent, job, cwdResult.cwd, model, undefined);
+		job.completion = runManagedAgent(ctx.cwd, prepared.agent, job, prepared.cwd, prepared.model, undefined);
 		job.completion.then((result) => {
-			pruneCompletedJobs();
+			pruneCompletedJobs(limits.completedJobRetention);
 			updateStatus();
 			if (deliverySuppressed.has(result.id)) return;
 			resultDelivery.defer(result);
@@ -678,8 +737,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		],
 		parameters: Type.Intersect([SubagentParamsSchema, Type.Object({ agent: Type.String(), task: Type.String() })]),
 		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-			const active = [...jobs.values()].filter((job) => job.status === "initializing" || job.status === "working").length;
-			if (active >= MAX_PARALLEL_TASKS) throw new Error(`Too many running subagents. Max is ${MAX_PARALLEL_TASKS}.`);
 			const job = await startBackground(toolCallId, params, ctx);
 			updateStatus();
 			return { content: [{ type: "text", text: `Spawned ${job.id} (${job.name}). Continue working; use subagent_wait when its result is needed.` }], details: { id: job.id, status: job.status } };
@@ -808,78 +865,32 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				}
 			}
 
-			const run = async (item: { agent: string; task: string; cwd?: string; name?: string; model?: string }) => {
-				const cwdResult = validateCwd(ctx.cwd, item.cwd);
-				const inheritedModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-				const profile = agents.find((candidate) => candidate.name === item.agent);
-				const model = resolveJobModel(item.model, params.model, profile?.model, inheritedModel);
-				const job = createJob(item.agent, item.task, cwdResult.cwd, item.name, {
+			const limits = loadSubagentLimits(ctx.cwd);
+			const launch = (prepared: PreparedTask, deliveryMode: JobDeliveryMetadata["mode"]) => {
+				const job = createJob(prepared.agent.name, prepared.request.task, prepared.cwd, prepared.request.name, {
 					parentSessionId: ctx.sessionManager.getSessionId(),
 					toolCallId,
-					model,
-					delivery: { mode: params.tasks?.length ? "batch" : "foreground", method: "tool-result", consumedByWait: false },
+					model: prepared.model,
+					limits,
+					timeoutMs: prepared.timeoutMs,
+					delivery: { mode: deliveryMode, method: "tool-result", consumedByWait: false },
 				});
-				const active = [...jobs.values()].filter((candidate) => candidate.status === "initializing" || candidate.status === "working").length;
-				if (active > MAX_PARALLEL_TASKS) {
-					const output = `Too many running subagents. Max is ${MAX_PARALLEL_TASKS}.`;
-					job.status = "failed";
-					job.output = output;
-					job.exitCode = 1;
-					job.finishedAt = Date.now();
-					jobStore.setOutput(job.id, output);
-					addJobLog(job, output);
-					return { id: job.id, name: job.name, agent: item.agent, task: item.task, status: "failed", exitCode: 1, output, stderr: "", messages: [] } satisfies RunResult;
-				}
-				if (cwdResult.error || !isTrustedChildCwd(ctx.cwd, cwdResult.cwd)) {
-					const error = cwdResult.error ?? "cwd must be the trusted project directory or one of its descendants.";
-					job.status = "failed";
-					job.output = error;
-					job.exitCode = 1;
-					job.finishedAt = Date.now();
-					jobStore.setOutput(job.id, error);
-					addJobLog(job, error);
-					return {
-						id: job.id,
-						name: job.name,
-						agent: item.agent,
-						task: item.task,
-						status: "failed",
-						exitCode: 1,
-						output: error,
-						stderr: "",
-						messages: [],
-					} satisfies RunResult;
-				}
-				const agent = profile;
-				if (!agent) {
-					const output = `Unknown agent. Available: ${agents.map((a) => a.name).join(", ") || "none"}`;
-					job.status = "failed";
-					job.output = output;
-					job.exitCode = 1;
-					job.finishedAt = Date.now();
-					jobStore.setOutput(job.id, output);
-					addJobLog(job, output);
-					return {
-						id: job.id,
-						name: job.name,
-						agent: item.agent,
-						task: item.task,
-						status: "failed",
-						exitCode: 1,
-						output,
-						stderr: "",
-						messages: [],
-					} satisfies RunResult;
-				}
-				return runManagedAgent(ctx.cwd, agent, job, cwdResult.cwd, model, signal);
+				return runManagedAgent(ctx.cwd, prepared.agent, job, prepared.cwd, prepared.model, signal);
 			};
 
 			if (hasSingle) {
+				let prepared: PreparedTask;
+				try {
+					prepared = prepareTask(ctx, agents, { agent: params.agent!, task: params.task!, cwd: params.cwd, name: params.name, model: params.model, timeoutMs: params.timeoutMs }, params.model, params.timeoutMs, limits);
+					assertCapacity(limits, 1);
+				} catch (error) {
+					return { content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], details: { mode: "single" }, isError: true };
+				}
 				onUpdate?.({
 					content: [{ type: "text", text: `Starting ${params.name ?? params.agent}...` }],
 					details: { mode: "single", jobs: formatStatusBlock() },
 				});
-				const result = await run({ agent: params.agent!, task: params.task!, cwd: params.cwd, name: params.name, model: params.model });
+				const result = await launch(prepared, "foreground");
 				return {
 					content: [{ type: "text", text: `Subagent ${result.id} (${result.name}) ${result.status}\n\n${result.output}` }],
 					details: { mode: "single", result: resultDetails(result) },
@@ -888,12 +899,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			}
 
 			const tasks = params.tasks ?? [];
-			if (tasks.length > MAX_PARALLEL_TASKS) {
-				return {
-					content: [{ type: "text", text: `Too many tasks (${tasks.length}). Max is ${MAX_PARALLEL_TASKS}.` }],
-					details: { mode: "parallel", results: [] },
-					isError: true,
-				};
+			let preparedTasks: PreparedTask[];
+			try {
+				preparedTasks = tasks.map((task) => prepareTask(ctx, agents, task, params.model, params.timeoutMs, limits));
+				assertCapacity(limits, preparedTasks.length);
+			} catch (error) {
+				return { content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], details: { mode: "parallel", results: [] }, isError: true };
 			}
 
 			onUpdate?.({
@@ -901,8 +912,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				details: { mode: "parallel", jobs: formatStatusBlock() },
 			});
 			const results = await Promise.all(
-				tasks.map(async (task) => {
-					const result = await run(task);
+				preparedTasks.map(async (prepared) => {
+					const result = await launch(prepared, "batch");
 					onUpdate?.({
 						content: [
 							{

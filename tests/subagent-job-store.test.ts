@@ -101,6 +101,18 @@ test("timeline, stderr, and output retention stay within configured bounds", () 
 	});
 });
 
+test("per-run output limits and updated completed retention are enforced", () => {
+	const store = new JobStore({ maxCompletedJobs: 3, now: () => 1 });
+	store.create(jobInput("sa-1"));
+	store.appendStderr("sa-1", "abcdef", 4);
+	const snapshot = store.setOutput("sa-1", "abcdef", 4);
+	assert.deepEqual(snapshot.stderr, { text: "cdef", totalBytes: 6, truncated: true });
+	assert.deepEqual(snapshot.output, { text: "abcd", totalBytes: 6, truncated: true });
+	store.update("sa-1", { status: "done" });
+	store.setCompletedJobRetention(0);
+	assert.equal(store.get("sa-1"), undefined);
+});
+
 test("streaming telemetry is coalesced and large payloads are bounded", () => {
 	const store = new JobStore({ now: () => 1 });
 	store.create(jobInput("sa-1"));
