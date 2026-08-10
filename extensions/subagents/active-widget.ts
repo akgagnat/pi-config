@@ -41,6 +41,8 @@ export class ActiveJobWidget {
 	private timer?: NodeJS.Timeout;
 	private ctx?: ExtensionContext;
 	private sessionId?: string;
+	private renderedSignature?: string;
+	private suspended = false;
 
 	constructor(private readonly store: JobStore, private readonly intervalMs = 1_000) {}
 
@@ -49,6 +51,7 @@ export class ActiveJobWidget {
 		if (ctx.mode !== "tui") return;
 		this.ctx = ctx;
 		this.sessionId = ctx.sessionManager.getSessionId();
+		this.suspended = false;
 		this.unsubscribe = this.store.subscribe(() => this.render());
 		this.render();
 	}
@@ -61,12 +64,34 @@ export class ActiveJobWidget {
 		this.ctx?.ui.setWidget(WIDGET_KEY, undefined);
 		this.ctx = undefined;
 		this.sessionId = undefined;
+		this.renderedSignature = undefined;
+		this.suspended = false;
+	}
+
+	/** Hide the widget while another full-height extension component owns the editor area. */
+	suspend(): void {
+		if (!this.ctx || this.suspended) return;
+		this.suspended = true;
+		if (this.timer) clearInterval(this.timer);
+		this.timer = undefined;
+		this.renderedSignature = undefined;
+		this.ctx.ui.setWidget(WIDGET_KEY, undefined);
+	}
+
+	resume(): void {
+		if (!this.ctx || !this.suspended) return;
+		this.suspended = false;
+		this.render();
 	}
 
 	private render(): void {
-		if (!this.ctx) return;
+		if (!this.ctx || this.suspended) return;
 		const lines = formatActiveJobWidget(this.store, Date.now(), this.sessionId);
-		this.ctx.ui.setWidget(WIDGET_KEY, lines.length ? lines : undefined, { placement: "belowEditor" });
+		const signature = lines.join("\n");
+		if (signature !== this.renderedSignature) {
+			this.renderedSignature = signature;
+			this.ctx.ui.setWidget(WIDGET_KEY, lines.length ? lines : undefined, { placement: "belowEditor" });
+		}
 		if (lines.length && !this.timer) {
 			this.timer = setInterval(() => this.render(), this.intervalMs);
 			this.timer.unref();

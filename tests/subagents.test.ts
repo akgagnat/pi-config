@@ -155,19 +155,24 @@ test("subagents opens the read-only live inspector", async () => {
 	);
 	assert.equal(result.isError, true);
 	let customCalls = 0;
+	let customOptions: unknown;
 	await commands.get("subagents").handler("", {
 		...baseCtx,
 		mode: "tui",
 		ui: {
 			...baseCtx.ui,
 			notify() {},
-			custom: async () => { customCalls++; },
+			custom: async (_factory: unknown, options: unknown) => { customCalls++; customOptions = options; },
 		},
 	});
 	assert.equal(commands.has("subagent-profiles"), true);
 	assert.equal(commands.has("subagents-status"), false);
 	assert.equal(commands.has("subagent-log"), false);
 	assert.equal(customCalls, 1);
+	assert.deepEqual(customOptions, {
+		overlay: true,
+		overlayOptions: { width: "100%", maxHeight: "100%", anchor: "center" },
+	});
 });
 
 test("job manager lets callers inspect work before collecting its result", async () => {

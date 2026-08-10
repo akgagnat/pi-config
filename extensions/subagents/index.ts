@@ -837,7 +837,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				await ctx.ui.editor("Subagent jobs", formatStatusBlock());
 				return;
 			}
-			await openSubagentInspector(ctx, jobStore);
+			// Keep the persistent widget hidden beneath the full-screen inspector.
+			activeWidget.suspend();
+			try {
+				await openSubagentInspector(ctx, jobStore);
+			} finally {
+				activeWidget.resume();
+			}
 		},
 	});
 

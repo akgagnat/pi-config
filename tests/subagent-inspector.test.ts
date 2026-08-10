@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { visibleWidth } from "@earendil-works/pi-tui";
 
-import { formatInspectorActivity, formatThinkingVisibility, getInspectorDetailLines, moveInspectorSelection } from "../extensions/subagents/inspector.ts";
+import { fitInspectorRows, formatInspectorActivity, formatThinkingVisibility, getInspectorDetailLines, getInspectorProjectionSignature, moveInspectorSelection, openSubagentInspector } from "../extensions/subagents/inspector.ts";
 import { JobStore } from "../extensions/subagents/job-store.ts";
 
 function inspectedJob() {
@@ -77,6 +78,55 @@ test("inspector distinguishes communication and context metadata", () => {
 	const metadata = getInspectorDetailLines(job, "Metadata", false).join("\n");
 	assert.match(metadata, /42k\/200k \(21\.0%\) · estimated/);
 	assert.match(metadata, /50k tokens · \$0\.1250/);
+});
+
+test("inspector viewport keeps a fixed height as streaming content grows", () => {
+	assert.deepEqual(fitInspectorRows(["one"], 3), ["one", "", ""]);
+	assert.deepEqual(fitInspectorRows(["one", "two", "three"], 2), ["one", "two"]);
+});
+
+test("inspector overlay fully covers the underlying terminal viewport", async () => {
+	let rendered: string[] = [];
+	let options: unknown;
+	const tui = { terminal: { rows: 30 }, requestRender() {} };
+	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+	const ctx = {
+		mode: "tui",
+		ui: {
+			custom: async (factory: any, receivedOptions: unknown) => {
+				options = receivedOptions;
+				const component = await factory(tui, theme, {}, () => {});
+				rendered = component.render(120);
+				component.dispose?.();
+			},
+		},
+	} as any;
+	await openSubagentInspector(ctx, new JobStore());
+	assert.deepEqual(options, {
+		overlay: true,
+		overlayOptions: { width: "100%", maxHeight: "100%", anchor: "center" },
+	});
+	assert.equal(rendered.length, 30);
+	assert.ok(rendered.every((line) => visibleWidth(line) === 120));
+});
+
+test("inspector redraw projection ignores updates hidden by the active view", () => {
+	const store = new JobStore({ now: () => 1 });
+	store.create({
+		id: "sa-1",
+		name: "review",
+		agent: "worker",
+		task: "Review authentication",
+		cwd: "/work/project",
+		parent: {},
+		model: { source: "default" },
+		delivery: { mode: "background", method: "deferred-follow-up", consumedByWait: false },
+	});
+	const activityBefore = getInspectorProjectionSignature(store, "sa-1", "Activity", false);
+	const conversationBefore = getInspectorProjectionSignature(store, "sa-1", "Conversation", false);
+	store.appendTimeline("sa-1", { type: "text-delta", contentIndex: 0, delta: "streaming", at: 2 });
+	assert.equal(getInspectorProjectionSignature(store, "sa-1", "Activity", false), activityBefore);
+	assert.notEqual(getInspectorProjectionSignature(store, "sa-1", "Conversation", false), conversationBefore);
 });
 
 test("activity formatter summarizes tool calls without dumping unbounded arguments", () => {

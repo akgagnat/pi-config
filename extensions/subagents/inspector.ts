@@ -172,6 +172,29 @@ function sortedInspectorJobs(store: JobStore): DeepReadonly<JobSnapshot>[] {
 	return store.list().sort((a, b) => b.startedAt - a.startedAt);
 }
 
+/** Keep the custom editor area stable while streaming content grows or scrolls. */
+export function fitInspectorRows(lines: readonly string[], height: number): string[] {
+	return Array.from({ length: height }, (_, index) => lines[index] ?? "");
+}
+
+/** Capture only content visible in the selected inspector view. */
+export function getInspectorProjectionSignature(store: JobStore, selectedId: string | undefined, view: InspectorView, showThinking: boolean): string {
+	const jobs = sortedInspectorJobs(store);
+	const selected = jobs.find((job) => job.id === selectedId) ?? jobs[0];
+	const context = selected ? latest(selected, "context") : undefined;
+	return JSON.stringify({
+		jobs: jobs.map((job) => [job.id, job.status, job.name]),
+		selected: selected ? {
+			id: selected.id,
+			status: selected.status,
+			agent: selected.agent,
+			model: selected.model.provider && selected.model.id ? `${selected.model.provider}/${selected.model.id}` : selected.model.requested ?? "default",
+			context: context ? [context.tokens, context.contextWindow] : undefined,
+			details: getInspectorDetailLines(selected, view, showThinking),
+		} : undefined,
+	});
+}
+
 export function moveInspectorSelection(jobs: readonly DeepReadonly<JobSnapshot>[], selectedId: string | undefined, delta: -1 | 1): string | undefined {
 	if (jobs.length === 0) return undefined;
 	const current = Math.max(0, jobs.findIndex((job) => job.id === selectedId));
@@ -189,11 +212,13 @@ export async function openSubagentInspector(ctx: ExtensionContext, store: JobSto
 		let showThinking = false;
 		let narrowDetail = false;
 		let renderTimer: NodeJS.Timeout | undefined;
+		let renderedProjection: string | undefined;
 		const requestRender = () => {
 			if (renderTimer) return;
 			renderTimer = setTimeout(() => {
 				renderTimer = undefined;
-				tui.requestRender();
+				const projection = getInspectorProjectionSignature(store, selectedId, VIEWS[viewIndex], showThinking);
+				if (projection !== renderedProjection) tui.requestRender();
 			}, 100);
 		};
 		const unsubscribe = store.subscribe(requestRender);
@@ -203,21 +228,26 @@ export async function openSubagentInspector(ctx: ExtensionContext, store: JobSto
 				let selected = Math.max(0, jobs.findIndex((candidate) => candidate.id === selectedId));
 				const job = jobs[selected];
 				selectedId = job?.id;
-				const height = Math.max(8, tui.terminal.rows - 4);
+				const height = Math.max(8, tui.terminal.rows);
 				const wide = width >= 100;
 				lastWide = wide;
 				const tabs = VIEWS.map((name, index) => index === viewIndex ? theme.fg("accent", `[${name}]`) : theme.fg("muted", name)).join("  ");
 				const header = theme.fg("accent", theme.bold("Subagent inspector"));
 				const thinkingVisibility = theme.fg(showThinking ? "warning" : "dim", formatThinkingVisibility(showThinking));
 				const help = `${theme.fg("dim", "↑↓ select · j/k scroll · enter inspect · tab view · f follow · t toggle")} · ${thinkingVisibility} · ${theme.fg("dim", "esc close")}`;
-				if (!job) return [header, "", theme.fg("muted", "No subagent jobs yet."), "", help].map((line) => truncateToWidth(line, width));
+				const bodyHeight = Math.max(3, height - 6);
+				if (!job) {
+					renderedProjection = getInspectorProjectionSignature(store, selectedId, VIEWS[viewIndex], showThinking);
+					const body = fitInspectorRows([theme.fg("muted", "No subagent jobs yet.")], bodyHeight);
+					return [header, "", tabs, "", ...body, "", help].map((line) => padToWidth(line, width));
+				}
+				renderedProjection = getInspectorProjectionSignature(store, selectedId, VIEWS[viewIndex], showThinking);
 				const context = latest(job, "context");
 				const summary = `${job.id} ${job.status} · ${safeText(job.agent)} · ${safeText(job.model.provider && job.model.id ? `${job.model.provider}/${job.model.id}` : job.model.requested ?? "default")} · ctx ${context?.tokens === null || !context ? "?" : formatCount(context.tokens)}/${context ? formatCount(context.contextWindow) : "?"}`;
 				const details = getInspectorDetailLines(job, VIEWS[viewIndex], showThinking).flatMap((line) => wrapTextWithAnsi(line, wide ? width - 38 : width));
-				const bodyHeight = Math.max(3, height - 5);
 				if (follow) scroll = Math.max(0, details.length - bodyHeight);
 				else scroll = Math.min(scroll, Math.max(0, details.length - bodyHeight));
-				const visibleDetails = details.slice(scroll, scroll + bodyHeight);
+				const visibleDetails = fitInspectorRows(details.slice(scroll, scroll + bodyHeight), bodyHeight);
 				if (!wide && !narrowDetail) {
 					const listStart = Math.max(0, Math.min(selected - bodyHeight + 1, jobs.length - bodyHeight));
 					const list = jobs.slice(listStart, listStart + bodyHeight).map((item, offset) => {
@@ -225,9 +255,9 @@ export async function openSubagentInspector(ctx: ExtensionContext, store: JobSto
 						const marker = index === selected ? theme.fg("accent", "> ") : "  ";
 						return truncateToWidth(`${marker}${item.id} ${item.status} ${safeText(item.name)}`, width);
 					});
-					return [header, theme.fg("muted", summary), "", ...list, "", help].map((line) => truncateToWidth(line, width));
+					return [header, theme.fg("muted", summary), tabs, "", ...fitInspectorRows(list, bodyHeight), "", help].map((line) => padToWidth(line, width));
 				}
-				if (!wide) return [header, theme.fg("muted", summary), tabs, "", ...visibleDetails, "", help].map((line) => truncateToWidth(line, width));
+				if (!wide) return [header, theme.fg("muted", summary), tabs, "", ...visibleDetails, "", help].map((line) => padToWidth(line, width));
 				const listWidth = 34;
 				const listStart = Math.max(0, Math.min(selected - bodyHeight + 1, jobs.length - bodyHeight));
 				const list = jobs.slice(listStart, listStart + bodyHeight).map((item, offset) => {
@@ -235,8 +265,8 @@ export async function openSubagentInspector(ctx: ExtensionContext, store: JobSto
 					const marker = index === selected ? theme.fg("accent", "> ") : "  ";
 					return `${marker}${item.id} ${item.status} ${safeText(item.name)}`;
 				});
-				const rows = Array.from({ length: Math.max(list.length, visibleDetails.length, 1) }, (_, index) => `${padToWidth(list[index] ?? "", listWidth)} │ ${truncateToWidth(visibleDetails[index] ?? "", width - listWidth - 3)}`);
-				return [header, theme.fg("muted", summary), tabs, "", ...rows, "", help].map((line) => truncateToWidth(line, width));
+				const rows = Array.from({ length: bodyHeight }, (_, index) => `${padToWidth(list[index] ?? "", listWidth)} │ ${truncateToWidth(visibleDetails[index] ?? "", width - listWidth - 3)}`);
+				return [header, theme.fg("muted", summary), tabs, "", ...rows, "", help].map((line) => padToWidth(line, width));
 			},
 			handleInput(data: string): void {
 				const jobs = sortedInspectorJobs(store);
@@ -274,5 +304,12 @@ export async function openSubagentInspector(ctx: ExtensionContext, store: JobSto
 			},
 		};
 		return component;
+	}, {
+		overlay: true,
+		overlayOptions: {
+			width: "100%",
+			maxHeight: "100%",
+			anchor: "center",
+		},
 	});
 }
